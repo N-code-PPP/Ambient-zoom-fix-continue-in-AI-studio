@@ -1817,6 +1817,12 @@ class PreferencesRepo(private val context: Context) {
         private var prefsSingleton: SharedPreferences? = null
 
         @Volatile
+        private var isUsingFallbackPrefs: Boolean = false
+
+        @Volatile
+        private var lastKeystoreRetryMonoMs: Long = 0L
+
+        @Volatile
         private var hotCacheInitialized: Boolean = false
 
         @Volatile
@@ -1855,45 +1861,86 @@ class PreferencesRepo(private val context: Context) {
             }
         }
 
-        private fun getSharedPrefsSingleton(appContext: Context): SharedPreferences {
-            prefsSingleton?.let { return it }
-            return synchronized(cacheLock) {
-                prefsSingleton ?: run {
-                    val sp = try {
-                        val masterKey = MasterKey.Builder(appContext)
-                            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                            .build()
-                        EncryptedSharedPreferences.create(
-                            appContext,
-                            "ambient_brain_secure_prefs",
-                            masterKey,
-                            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-                        )
-                    } catch (_: Exception) {
-                        appContext.getSharedPreferences("ambient_brain_fallback_prefs", Context.MODE_PRIVATE)
-                    }
-                    sp.registerOnSharedPreferenceChangeListener(hotPrefListener)
-                    prefsSingleton = sp
-                    sp
-                }
+        private fun tryOpenEncryptedPrefs(appContext: Context): SharedPreferences? {
+            return try {
+                val masterKey = MasterKey.Builder(appContext)
+                    .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                    .build()
+                EncryptedSharedPreferences.create(
+                    appContext,
+                    "ambient_brain_secure_prefs",
+                    masterKey,
+                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+                )
+            } catch (_: Exception) {
+                null
             }
         }
 
+        private fun hydrateHotCacheLocked(sp: SharedPreferences): MicSharingMode {
+            cachedListeningEnabled = sp.getBoolean(KEY_LISTENING_ENABLED, true)
+            val mode = parseMicSharingMode(sp.getString(KEY_MIC_SHARING_MODE, null))
+            cachedMicSharingMode = mode
+            cachedMinMeaningfulSpeechSec = sp.getInt(KEY_MIN_MEANINGFUL_SPEECH_SEC, 3).coerceIn(1, 60)
+            cachedSilenceSplitSec = sp.getInt(KEY_SILENCE_SPLIT_SEC, 90).coerceIn(30, 300)
+            cachedRoundSilenceSplitSec = sp.getInt(KEY_ROUND_SILENCE_SPLIT_SEC, 300).coerceIn(120, 900)
+            hotCacheInitialized = true
+            return mode
+        }
+
+        private fun getSharedPrefsSingleton(appContext: Context): SharedPreferences {
+            val current = prefsSingleton
+            if (current != null && !isUsingFallbackPrefs) return current
+
+            var recoveredMode: MicSharingMode? = null
+            val resolved = synchronized(cacheLock) {
+                val lockedCurrent = prefsSingleton
+                if (lockedCurrent != null && !isUsingFallbackPrefs) {
+                    lockedCurrent
+                } else {
+                    val nowMono = android.os.SystemClock.elapsedRealtime()
+                    val shouldTryEncrypted = lockedCurrent == null || (nowMono - lastKeystoreRetryMonoMs >= 10_000L)
+                    val encrypted = if (shouldTryEncrypted) {
+                        lastKeystoreRetryMonoMs = nowMono
+                        tryOpenEncryptedPrefs(appContext)
+                    } else {
+                        null
+                    }
+                    if (encrypted != null) {
+                        lockedCurrent?.unregisterOnSharedPreferenceChangeListener(hotPrefListener)
+                        encrypted.registerOnSharedPreferenceChangeListener(hotPrefListener)
+                        prefsSingleton = encrypted
+                        val wasFallback = isUsingFallbackPrefs
+                        isUsingFallbackPrefs = false
+                        if (wasFallback || !hotCacheInitialized) {
+                            recoveredMode = hydrateHotCacheLocked(encrypted)
+                        }
+                        encrypted
+                    } else if (lockedCurrent != null) {
+                        lockedCurrent
+                    } else {
+                        val fallback = appContext.getSharedPreferences("ambient_brain_fallback_prefs", Context.MODE_PRIVATE)
+                        fallback.registerOnSharedPreferenceChangeListener(hotPrefListener)
+                        prefsSingleton = fallback
+                        isUsingFallbackPrefs = true
+                        fallback
+                    }
+                }
+            }
+            recoveredMode?.let { mode ->
+                CaptureStateBus.update { it.copy(micSharingMode = mode) }
+            }
+            return resolved
+        }
+
         private fun ensureHotCacheInitialized(appContext: Context) {
-            if (hotCacheInitialized) return
+            if (hotCacheInitialized && !isUsingFallbackPrefs) return
             var initializedMode: MicSharingMode? = null
+            val sp = getSharedPrefsSingleton(appContext)
             synchronized(cacheLock) {
                 if (!hotCacheInitialized) {
-                    val sp = getSharedPrefsSingleton(appContext)
-                    cachedListeningEnabled = sp.getBoolean(KEY_LISTENING_ENABLED, true)
-                    val mode = parseMicSharingMode(sp.getString(KEY_MIC_SHARING_MODE, null))
-                    cachedMicSharingMode = mode
-                    initializedMode = mode
-                    cachedMinMeaningfulSpeechSec = sp.getInt(KEY_MIN_MEANINGFUL_SPEECH_SEC, 3).coerceIn(1, 60)
-                    cachedSilenceSplitSec = sp.getInt(KEY_SILENCE_SPLIT_SEC, 90).coerceIn(30, 300)
-                    cachedRoundSilenceSplitSec = sp.getInt(KEY_ROUND_SILENCE_SPLIT_SEC, 300).coerceIn(120, 900)
-                    hotCacheInitialized = true
+                    initializedMode = hydrateHotCacheLocked(sp)
                 }
             }
             initializedMode?.let { mode ->

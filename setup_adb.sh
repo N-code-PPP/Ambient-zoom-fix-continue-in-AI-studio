@@ -14,6 +14,7 @@ A11Y_SHORT="$PKG/.service.AmbientCaptureAccessibilityService"
 echo "==> [1/5] Granting runtime permissions & Zero-Touch Self-Heal (WRITE_SECURE_SETTINGS)..."
 adb shell pm grant --user 0 "$PKG" android.permission.RECORD_AUDIO || adb shell pm grant "$PKG" android.permission.RECORD_AUDIO
 adb shell pm grant --user 0 "$PKG" android.permission.READ_PHONE_STATE || adb shell pm grant "$PKG" android.permission.READ_PHONE_STATE || true
+adb shell pm grant --user 0 "$PKG" android.permission.POST_NOTIFICATIONS || adb shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS || true
 adb shell pm grant --user 0 "$PKG" android.permission.WRITE_SECURE_SETTINGS || adb shell pm grant "$PKG" android.permission.WRITE_SECURE_SETTINGS
 
 echo "==> [2/5] Configuring AppOps (Mic + Restricted Settings + Overlay + PROJECT_MEDIA + UsageStats)..."
@@ -34,7 +35,7 @@ adb shell settings put global settings_enable_monitor_phantom_procs false || tru
 adb shell device_config put activity_manager max_phantom_processes 2147483647 || true
 
 echo "==> [4/5] Appending & rebinding AmbientCaptureAccessibilityService without wiping other services..."
-CURRENT_A11Y=$((adb shell settings get secure enabled_accessibility_services || true) | tr -d '\r\n')
+CURRENT_A11Y=$( (adb shell settings get secure enabled_accessibility_services || true) | tr -d '\r\n' )
 CLEAN_A11Y=$(printf '%s\n' "$CURRENT_A11Y" | awk -v a="$A11Y_FULL" -v b="$A11Y_SHORT" -F: '{
     out = ""
     for (i = 1; i <= NF; i++) {
@@ -60,8 +61,8 @@ adb shell settings put secure accessibility_enabled 1
 echo "==> [5/5] Verifying setup..."
 echo "Enabled Accessibility Services: $(adb shell settings get secure enabled_accessibility_services || true)"
 adb shell cmd appops get "$PKG" | grep -E "RECORD_AUDIO|ACCESS_RESTRICTED_SETTINGS|SYSTEM_ALERT_WINDOW|PROJECT_MEDIA|RUN_ANY_IN_BACKGROUND|AUTO_REVOKE|GET_USAGE_STATS" || adb shell cmd appops get "$PKG"
-PHANTOM_MON=$((adb shell settings get global settings_enable_monitor_phantom_procs 2>/dev/null || true) | tr -d '\r\n')
-PHANTOM_MAX=$((adb shell device_config get activity_manager max_phantom_processes 2>/dev/null || true) | tr -d '\r\n')
+PHANTOM_MON=$( (adb shell settings get global settings_enable_monitor_phantom_procs 2>/dev/null || true) | tr -d '\r\n' )
+PHANTOM_MAX=$( (adb shell device_config get activity_manager max_phantom_processes 2>/dev/null || true) | tr -d '\r\n' )
 echo "Phantom Monitor Disabled Setting: ${PHANTOM_MON:-unset} | Max Phantom Processes: ${PHANTOM_MAX:-unset}"
 
 cat << 'EOF'

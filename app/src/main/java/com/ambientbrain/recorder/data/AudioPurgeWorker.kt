@@ -8,6 +8,8 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.ambientbrain.recorder.service.AmbientCaptureAccessibilityService
+import com.ambientbrain.recorder.service.MeetingMetadataHelper
+import com.ambientbrain.recorder.service.MeetingRecorderStateBus
 import com.ambientbrain.recorder.service.ShizukuAdbManager
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -20,12 +22,25 @@ import java.util.concurrent.TimeUnit
  * `WRITE_SECURE_SETTINGS` was granted, keeping 24/7 capture resilient without notifications.
  *
  * Permanent task/note voice proof clips (`/files/clips/clip_<itemId>.m4a`), transcripts,
- * round sheets, and summaries are NEVER deleted by this worker.
+ * round sheets, public gallery exports, and summaries are NEVER deleted by this worker.
  */
 class AudioPurgeWorker(
     appContext: Context,
     params: WorkerParameters
 ) : CoroutineWorker(appContext, params) {
+
+    private fun isInsideAppPrivateStorage(file: File): Boolean {
+        val canonical = runCatching { file.canonicalPath }.getOrElse { return false }
+        val allowedRoots = listOfNotNull(
+            runCatching { applicationContext.filesDir.canonicalPath }.getOrNull(),
+            runCatching { applicationContext.cacheDir.canonicalPath }.getOrNull(),
+            runCatching { applicationContext.externalCacheDir?.canonicalPath }.getOrNull(),
+            runCatching { applicationContext.getExternalFilesDir(null)?.canonicalPath }.getOrNull()
+        )
+        return allowedRoots.any { root ->
+            canonical == root || canonical.startsWith("$root${File.separator}")
+        }
+    }
 
     override suspend fun doWork(): Result {
         val db = AppDatabase.get(applicationContext).dao()
@@ -54,12 +69,29 @@ class AudioPurgeWorker(
                     rawFile.delete()
                 }
             }
+            // Also reclaim app-private internal meeting tracks (never touching public gallery/Downloads copies)
+            val meetingMarker = MeetingMetadataHelper.parseFirst(session.callEventsJson)
+            if (meetingMarker != null) {
+                listOfNotNull(meetingMarker.geminiAudioPath, meetingMarker.videoPath)
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() && it != rawPath }
+                    .distinct()
+                    .forEach { extraPath ->
+                        runCatching {
+                            val f = File(extraPath)
+                            if (f.exists() && isInsideAppPrivateStorage(f)) {
+                                f.delete()
+                            }
+                        }
+                    }
+            }
             db.markSessionRawAudioPurged(session.id)
             purgedCount++
         }
 
         // Also sweep any orphaned temporary chunk directories or share exports older than 24 hours
-        val oneDayAgo = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(24)
+        val nowMs = System.currentTimeMillis()
+        val oneDayAgo = nowMs - TimeUnit.HOURS.toMillis(24)
         runCatching {
             File(applicationContext.cacheDir, "audio_chunks").listFiles()?.forEach { dir ->
                 if (dir.lastModified() < oneDayAgo) {
@@ -71,6 +103,24 @@ class AudioPurgeWorker(
             File(applicationContext.cacheDir, "exports").listFiles()?.forEach { file ->
                 if (file.lastModified() < oneDayAgo) {
                     file.delete()
+                }
+            }
+        }
+
+        // Reclaim orphaned Stealth ADB temp media/preview files left behind by an OS kill/OOM
+        val meetingState = MeetingRecorderStateBus.state.value
+        if (!meetingState.isRecording && !meetingState.isFinalizing) {
+            val sixHoursAgo = nowMs - TimeUnit.HOURS.toMillis(6)
+            runCatching {
+                applicationContext.externalCacheDir?.listFiles()?.forEach { file ->
+                    val name = file.name
+                    val isStealthTemp = name.startsWith("adb_vdisp_") ||
+                        name.startsWith("adb_vaud_") ||
+                        name.startsWith("preview_") ||
+                        name.endsWith(".tmp")
+                    if (isStealthTemp && file.lastModified() < sixHoursAgo) {
+                        file.delete()
+                    }
                 }
             }
         }

@@ -499,12 +499,13 @@ object ShizukuAdbManager {
 
     private fun runProcessWithTimeout(
         proc: java.lang.Process,
-        timeoutSec: Long
+        timeoutSec: Long,
+        maxOutputBytes: Int = 256 * 1024
     ): ProcessExecResult {
         val outRef = java.util.concurrent.atomic.AtomicReference("")
         val errRef = java.util.concurrent.atomic.AtomicReference("")
         val outThread = Thread({
-            outRef.set(readBoundedStream(proc.inputStream))
+            outRef.set(readBoundedStream(proc.inputStream, maxBytes = maxOutputBytes))
         }, "Shizuku-Stdout").apply {
             isDaemon = true
             start()
@@ -691,10 +692,14 @@ object ShizukuAdbManager {
                 }
             }
 
-            try {
-                process.inputStream.bufferedReader().useLines { lines ->
-                    var sectionLineCount = 0
-                    for (rawLine in lines) {
+            val execRes = runProcessWithTimeout(
+                proc = process,
+                timeoutSec = 4L,
+                maxOutputBytes = 1024 * 1024
+            )
+            execRes.stdout.lineSequence().let { lines ->
+                var sectionLineCount = 0
+                for (rawLine in lines) {
                         val line = rawLine.trimEnd()
                         when {
                             line == "===PHANTOM===" -> {
@@ -832,21 +837,12 @@ object ShizukuAdbManager {
                                         }
                                     }
                                 }
-                            }
                         }
                     }
                 }
-
-                runCatching { process.errorStream.bufferedReader().readText() }
-                runCatching {
-                    if (!process.waitFor(3, TimeUnit.SECONDS)) {
-                        process.destroyForcibly()
-                    }
-                }
-            } finally {
-                runCatching {
-                    if (process.isAlive) process.destroy()
-                }
+            }
+            if (execRes.timedOut) {
+                Log.w(TAG, "dumpsys audio/flinger inspection timed out after 4s; using partial snapshot")
             }
 
             // Reconcile live sessions from OS AudioRecordingConfiguration + AudioFlinger + AudioService
@@ -1015,6 +1011,11 @@ object ShizukuAdbManager {
             AdbCommandSpec(
                 "Grant Runtime READ_PHONE_STATE",
                 "pm grant --user 0 $pkg android.permission.READ_PHONE_STATE || pm grant $pkg android.permission.READ_PHONE_STATE",
+                optional = true
+            ),
+            AdbCommandSpec(
+                "Grant Runtime POST_NOTIFICATIONS (Meeting Controls)",
+                "pm grant --user 0 $pkg android.permission.POST_NOTIFICATIONS || pm grant $pkg android.permission.POST_NOTIFICATIONS",
                 optional = true
             ),
             AdbCommandSpec(
@@ -1194,6 +1195,7 @@ object ShizukuAdbManager {
             echo "[1/5] Granting Runtime Permissions & Zero-Touch Self-Heal (WRITE_SECURE_SETTINGS)..."
             adb shell pm grant --user 0 "${'$'}PKG" android.permission.RECORD_AUDIO || adb shell pm grant "${'$'}PKG" android.permission.RECORD_AUDIO
             adb shell pm grant --user 0 "${'$'}PKG" android.permission.READ_PHONE_STATE || adb shell pm grant "${'$'}PKG" android.permission.READ_PHONE_STATE || true
+            adb shell pm grant --user 0 "${'$'}PKG" android.permission.POST_NOTIFICATIONS || adb shell pm grant "${'$'}PKG" android.permission.POST_NOTIFICATIONS || true
             adb shell pm grant --user 0 "${'$'}PKG" android.permission.WRITE_SECURE_SETTINGS || adb shell pm grant "${'$'}PKG" android.permission.WRITE_SECURE_SETTINGS
 
             echo "[2/5] Configuring AppOps (Mic + Restricted Settings + Overlay + PROJECT_MEDIA + UsageStats)..."

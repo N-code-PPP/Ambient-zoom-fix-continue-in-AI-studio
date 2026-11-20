@@ -162,6 +162,21 @@ class MainActivity : ComponentActivity() {
             isDaemon = true
         }
     }
+    private val shizukuPermissionListener = rikka.shizuku.Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+        if (requestCode == com.ambientbrain.recorder.service.ShizukuAdbManager.SHIZUKU_REQ_CODE) {
+            if (grantResult == PackageManager.PERMISSION_GRANTED) {
+                Toast.makeText(applicationContext, "Shizuku permission granted!", Toast.LENGTH_SHORT).show()
+                runCatching {
+                    selfHealExecutor.execute {
+                        if (!MeetingRecorderStateBus.state.value.isRecording) {
+                            com.ambientbrain.recorder.service.AdbVirtualScreenController
+                                .restorePendingAppOpsMicLockIfAny(applicationContext)
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     private fun handleIntentForMeetingRecorder(intent: Intent?) {
         if (intent?.getBooleanExtra(MeetingRecorderService.EXTRA_OPEN_MEETING_RECORDER, false) == true) {
@@ -254,21 +269,7 @@ class MainActivity : ComponentActivity() {
         }
 
         runCatching {
-            rikka.shizuku.Shizuku.addRequestPermissionResultListener { requestCode, grantResult ->
-                if (requestCode == com.ambientbrain.recorder.service.ShizukuAdbManager.SHIZUKU_REQ_CODE) {
-                    if (grantResult == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                        android.widget.Toast.makeText(this, "Shizuku permission granted!", android.widget.Toast.LENGTH_SHORT).show()
-                        runCatching {
-                            selfHealExecutor.execute {
-                                if (!MeetingRecorderStateBus.state.value.isRecording) {
-                                    com.ambientbrain.recorder.service.AdbVirtualScreenController
-                                        .restorePendingAppOpsMicLockIfAny(applicationContext)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            rikka.shizuku.Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
         }
 
         setContent {
@@ -298,6 +299,16 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         handleIntentForMeetingRecorder(intent)
+    }
+
+    override fun onDestroy() {
+        runCatching {
+            rikka.shizuku.Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
+        }
+        runCatching {
+            selfHealExecutor.shutdownNow()
+        }
+        super.onDestroy()
     }
 }
 
@@ -421,6 +432,10 @@ private fun AmbientBrainMainApp(
             context,
             Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
+        val hasPostNotif = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
 
         if (hasMic) {
             if (!AmbientCaptureAccessibilityService.isSystemBound &&
@@ -437,13 +452,18 @@ private fun AmbientBrainMainApp(
                 }
             }
             onStartListening()
+            if (!hasPostNotif) {
+                permissionLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+            }
         } else {
-            permissionLauncher.launch(
-                arrayOf(
-                    Manifest.permission.RECORD_AUDIO,
-                    Manifest.permission.READ_PHONE_STATE
-                )
+            val toRequest = mutableListOf(
+                Manifest.permission.RECORD_AUDIO,
+                Manifest.permission.READ_PHONE_STATE
             )
+            if (!hasPostNotif) {
+                toRequest.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+            permissionLauncher.launch(toRequest.toTypedArray())
         }
     }
 

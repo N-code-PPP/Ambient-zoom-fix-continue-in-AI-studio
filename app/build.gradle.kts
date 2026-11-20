@@ -11,7 +11,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.ambientbrain.recorder"
+        applicationId = "test.ambient.app"
         minSdk = 34
         targetSdk = 35
         versionCode = 18

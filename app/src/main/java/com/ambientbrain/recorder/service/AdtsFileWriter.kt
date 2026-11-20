@@ -40,6 +40,7 @@ class AdtsFileWriter(
     private val isStarted = AtomicBoolean(false)
     private val stopRequested = AtomicBoolean(false)
     private var encoderThread: Thread? = null
+    private val codecLock = Any()
 
     // Pre-allocated scratch buffers to avoid per-frame ByteArray allocations
     private val adtsHeaderScratch = ByteArray(7)
@@ -124,50 +125,54 @@ class AdtsFileWriter(
             }
             if (buf == null) {
                 // Drain any pending codec output once when interval/silence pause occurs
-                val encoder = codec
-                if (encoder != null) {
-                    runCatching { drainOutput(encoder, endOfStream = false) }
-                        .onFailure { handleCodecFailure(it) }
+                synchronized(codecLock) {
+                    val encoder = codec
+                    if (encoder != null && !stopRequested.get()) {
+                        runCatching { drainOutput(encoder, endOfStream = false) }
+                            .onFailure { handleCodecFailure(it) }
+                    }
                 }
                 continue
             }
 
             pendingBuffer = buf
-            val encoder = codec
-            if (encoder == null) {
-                pool.returnFreeBuffer(buf)
-                pendingBuffer = null
-                continue
-            }
-
             try {
-                while (buf.hasRemaining()) {
-                    val inputBufferIndex = encoder.dequeueInputBuffer(5_000L)
-                    if (inputBufferIndex >= 0) {
-                        val inputBuffer = encoder.getInputBuffer(inputBufferIndex)
-                        if (inputBuffer != null) {
-                            inputBuffer.clear()
-                            val bytesToCopy = minOf(inputBuffer.remaining(), buf.remaining())
-                            val oldLimit = buf.limit()
-                            buf.limit(buf.position() + bytesToCopy)
-                            inputBuffer.put(buf)
-                            buf.limit(oldLimit)
+                synchronized(codecLock) {
+                    val encoder = codec
+                    if (encoder != null) {
+                        while (buf.hasRemaining()) {
+                            val inputBufferIndex = encoder.dequeueInputBuffer(5_000L)
+                            if (inputBufferIndex >= 0) {
+                                val inputBuffer = encoder.getInputBuffer(inputBufferIndex)
+                                if (inputBuffer != null) {
+                                    inputBuffer.clear()
+                                    val bytesToCopy = minOf(inputBuffer.remaining(), buf.remaining())
+                                    val oldLimit = buf.limit()
+                                    buf.limit(buf.position() + bytesToCopy)
+                                    inputBuffer.put(buf)
+                                    buf.limit(oldLimit)
 
-                            val samplesFed = bytesToCopy / 2
-                            val totalSamplesBefore = totalSamplesInput.getAndAdd(samplesFed.toLong())
-                            val ptsUs = (totalSamplesBefore * 1_000_000L) / SAMPLE_RATE
-                            encoder.queueInputBuffer(inputBufferIndex, 0, bytesToCopy, ptsUs, 0)
+                                    val samplesFed = bytesToCopy / 2
+                                    val totalSamplesBefore = totalSamplesInput.getAndAdd(samplesFed.toLong())
+                                    val ptsUs = (totalSamplesBefore * 1_000_000L) / SAMPLE_RATE
+                                    encoder.queueInputBuffer(inputBufferIndex, 0, bytesToCopy, ptsUs, 0)
+                                }
+                                drainOutput(encoder, endOfStream = false)
+                            } else {
+                                // Timeout waiting for an input buffer: drain output first without dropping buf
+                                drainOutput(encoder, endOfStream = false)
+                            }
                         }
-                        drainOutput(encoder, endOfStream = false)
-                    } else {
-                        // Timeout waiting for an input buffer: drain output first without dropping buf
-                        drainOutput(encoder, endOfStream = false)
                     }
                 }
                 pool.returnFreeBuffer(buf)
                 pendingBuffer = null
             } catch (e: Exception) {
-                handleCodecFailure(e)
+                synchronized(codecLock) {
+                    if (!stopRequested.get()) {
+                        handleCodecFailure(e)
+                    }
+                }
                 pool.returnFreeBuffer(buf)
                 pendingBuffer = null
             }
@@ -223,28 +228,30 @@ class AdtsFileWriter(
             return
         }
 
-        val encoder = codec ?: return
-        var idx = offset
-        val end = offset + length
+        synchronized(codecLock) {
+            val encoder = codec ?: return
+            var idx = offset
+            val end = offset + length
 
-        while (idx < end) {
-            try {
-                val inputBufferIndex = encoder.dequeueInputBuffer(5_000L)
-                if (inputBufferIndex >= 0) {
-                    val inputBuffer = encoder.getInputBuffer(inputBufferIndex) ?: continue
-                    inputBuffer.clear()
-                    inputBuffer.order(ByteOrder.nativeOrder())
-                    val maxShorts = (inputBuffer.remaining() / 2).coerceAtMost(end - idx)
-                    inputBuffer.asShortBuffer().put(samples, idx, maxShorts)
-                    val totalBefore = totalSamplesInput.getAndAdd(maxShorts.toLong())
-                    val ptsUs = (totalBefore * 1_000_000L) / SAMPLE_RATE
-                    encoder.queueInputBuffer(inputBufferIndex, 0, maxShorts * 2, ptsUs, 0)
-                    idx += maxShorts
+            while (idx < end) {
+                try {
+                    val inputBufferIndex = encoder.dequeueInputBuffer(5_000L)
+                    if (inputBufferIndex >= 0) {
+                        val inputBuffer = encoder.getInputBuffer(inputBufferIndex) ?: continue
+                        inputBuffer.clear()
+                        inputBuffer.order(ByteOrder.nativeOrder())
+                        val maxShorts = (inputBuffer.remaining() / 2).coerceAtMost(end - idx)
+                        inputBuffer.asShortBuffer().put(samples, idx, maxShorts)
+                        val totalBefore = totalSamplesInput.getAndAdd(maxShorts.toLong())
+                        val ptsUs = (totalBefore * 1_000_000L) / SAMPLE_RATE
+                        encoder.queueInputBuffer(inputBufferIndex, 0, maxShorts * 2, ptsUs, 0)
+                        idx += maxShorts
+                    }
+                    drainOutput(encoder, endOfStream = false)
+                } catch (e: Exception) {
+                    handleCodecFailure(e)
+                    break
                 }
-                drainOutput(encoder, endOfStream = false)
-            } catch (e: Exception) {
-                handleCodecFailure(e)
-                break
             }
         }
     }
@@ -256,35 +263,41 @@ class AdtsFileWriter(
 
         encoderThread?.let { thread ->
             runCatching { thread.join(3_000L) }
+            if (thread.isAlive) {
+                thread.interrupt()
+                runCatching { thread.join(500L) }
+            }
         }
         encoderThread = null
 
-        val encoder = codec
-        if (encoder != null) {
-            try {
-                val inputBufferIndex = encoder.dequeueInputBuffer(10_000L)
-                if (inputBufferIndex >= 0) {
-                    val ptsUs = (totalSamplesInput.get() * 1_000_000L) / SAMPLE_RATE
-                    encoder.queueInputBuffer(
-                        inputBufferIndex,
-                        0,
-                        0,
-                        ptsUs,
-                        MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                    )
+        synchronized(codecLock) {
+            val encoder = codec
+            if (encoder != null) {
+                try {
+                    val inputBufferIndex = encoder.dequeueInputBuffer(10_000L)
+                    if (inputBufferIndex >= 0) {
+                        val ptsUs = (totalSamplesInput.get() * 1_000_000L) / SAMPLE_RATE
+                        encoder.queueInputBuffer(
+                            inputBufferIndex,
+                            0,
+                            0,
+                            ptsUs,
+                            MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                        )
+                    }
+                    drainOutput(encoder, endOfStream = true)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error draining encoder on close", e)
+                } finally {
+                    runCatching { encoder.stop() }
+                    runCatching { encoder.release() }
                 }
-                drainOutput(encoder, endOfStream = true)
-            } catch (e: Exception) {
-                Log.w(TAG, "Error draining encoder on close", e)
-            } finally {
-                runCatching { encoder.stop() }
-                runCatching { encoder.release() }
             }
+            codec = null
+            runCatching { outputStream?.flush() }
+            runCatching { outputStream?.close() }
+            outputStream = null
         }
-        codec = null
-        runCatching { outputStream?.flush() }
-        runCatching { outputStream?.close() }
-        outputStream = null
     }
 
     val writtenDurationMs: Long
