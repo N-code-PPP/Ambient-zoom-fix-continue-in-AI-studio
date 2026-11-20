@@ -3562,18 +3562,38 @@ object VoiceProfileAutoManager {
                 continue
             }
 
-            val keysToTry = strategy.orderedKeys
+            val triedKeys = LinkedHashSet<String>()
             val strictModel = modelIdx == 0 && hasFallback
             var sawQuotaBillingOrUnavailable = false
             var sawNetworkOffline = false
+            val maxAttemptsForModel = strategy.orderedKeys.size
 
-            for ((attemptIdx, keyCandidate) in keysToTry.withIndex()) {
+            for (attemptIdx in 0 until maxAttemptsForModel) {
                 if (prefs.isGeminiUsagePausedNow()) {
                     throw IllegalStateException("Gemini AI was paused during Voice Profile Audit.")
                 }
+                val stepDecision = if (attemptIdx == 0) {
+                    strategy
+                } else {
+                    GeminiRateLimitManager.planRequestStrategy(
+                        prefs = prefs,
+                        model = activeModel,
+                        estimatedInputTokens = estTokens,
+                        hasFallbackModel = hasNextFallback,
+                        excludedKeys = triedKeys
+                    )
+                }
+                if (attemptIdx > 0 && hasNextFallback && stepDecision.recommendProactiveFallback) {
+                    sawQuotaBillingOrUnavailable = true
+                    break
+                }
+                val keyCandidate = stepDecision.orderedKeys.firstOrNull() ?: break
+                triedKeys.add(keyCandidate)
+
                 val slot = orderedPool.indexOf(keyCandidate).let { if (it >= 0) it + 1 else attemptIdx + 1 }
+                var reservation: SlotReservation? = null
                 try {
-                    GeminiRateLimitManager.acquireSlotBeforeCall(
+                    reservation = GeminiRateLimitManager.acquireSlotBeforeCall(
                         prefs = prefs,
                         apiKey = keyCandidate,
                         model = activeModel,
@@ -3593,15 +3613,22 @@ object VoiceProfileAutoManager {
                         prefs = prefs,
                         apiKey = keyCandidate,
                         model = resolvedModel,
-                        actualInputTokens = resp.inputTokens
+                        actualInputTokens = resp.inputTokens,
+                        reservation = reservation
                     )
                     val fallbackTag = if (modelIdx > 0) " (fallback)" else ""
                     return resp to "$resolvedModel$fallbackTag:key-pool#$slot"
                 } catch (e: kotlinx.coroutines.CancellationException) {
+                    GeminiRateLimitManager.releaseFailedSlot(prefs, reservation, keepRpmCount = false)
                     throw e
                 } catch (e: Exception) {
                     lastErr = e
                     val cls = GeminiInteractionsClient.classifyApiFailure(e)
+                    GeminiRateLimitManager.releaseFailedSlot(
+                        prefs = prefs,
+                        reservation = reservation,
+                        keepRpmCount = cls.isQuotaOrBilling
+                    )
                     val retryAfterMs = if (cls.isQuotaOrBilling) {
                         GeminiRateLimitManager.learnFrom429Response(
                             prefs = prefs,

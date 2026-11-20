@@ -1328,28 +1328,51 @@ class SessionAnalyzeWorker(
                 continue
             }
 
-            val keysToTry = strategy.orderedKeys
+            val triedKeys = LinkedHashSet<String>()
             val strictModel = modelIdx == 0 && hasFallback
             var sawQuotaBillingOrUnavailable = false
             var sawNetworkOffline = false
+            val maxAttemptsForModel = strategy.orderedKeys.size
 
-            for ((attemptIdx, keyCandidate) in keysToTry.withIndex()) {
+            for (attemptIdx in 0 until maxAttemptsForModel) {
                 if (prefs.isGeminiUsagePausedNow()) {
                     throw GeminiUsagePausedException(prefs.geminiPausedUntilMs)
                 }
+
+                // Re-score remaining untried keys live so failover always picks the fastest instant-ready key
+                val stepDecision = if (attemptIdx == 0) {
+                    strategy
+                } else {
+                    GeminiRateLimitManager.planRequestStrategy(
+                        prefs = prefs,
+                        model = activeModel,
+                        estimatedInputTokens = estimatedInputTokens,
+                        hasFallbackModel = hasNextFallback,
+                        excludedKeys = triedKeys
+                    )
+                }
+                if (attemptIdx > 0 && hasNextFallback && stepDecision.recommendProactiveFallback) {
+                    Log.i(TAG, "Rate-limit strategy shifting mid-failover to fallback '$fallbackModel': ${stepDecision.strategyNote}")
+                    sawQuotaBillingOrUnavailable = true
+                    break
+                }
+                val keyCandidate = stepDecision.orderedKeys.firstOrNull() ?: break
+                triedKeys.add(keyCandidate)
 
                 val slot = orderedPool.indexOf(keyCandidate).let { if (it >= 0) it + 1 else attemptIdx + 1 }
                 val mask = if (keyCandidate.length > 10) {
                     "${keyCandidate.take(6)}...${keyCandidate.takeLast(4)}"
                 } else "Key #$slot"
+                var reservation: SlotReservation? = null
                 try {
-                    GeminiRateLimitManager.acquireSlotBeforeCall(
+                    reservation = GeminiRateLimitManager.acquireSlotBeforeCall(
                         prefs = prefs,
                         apiKey = keyCandidate,
                         model = activeModel,
                         estimatedInputTokens = estimatedInputTokens
                     )
                     if (prefs.isGeminiUsagePausedNow()) {
+                        GeminiRateLimitManager.releaseFailedSlot(prefs, reservation, keepRpmCount = false)
                         throw GeminiUsagePausedException(prefs.geminiPausedUntilMs)
                     }
                     val resp = callApiKey(keyCandidate, activeModel, strictModel)
@@ -1359,21 +1382,29 @@ class SessionAnalyzeWorker(
                         prefs = prefs,
                         apiKey = keyCandidate,
                         model = resolvedModel,
-                        actualInputTokens = resp.inputTokens
+                        actualInputTokens = resp.inputTokens,
+                        reservation = reservation
                     )
                     val fallbackTag = if (modelIdx > 0) " (fallback)" else ""
                     Log.i(
                         TAG,
-                        "API Key Pool pick #$slot/${keysToTry.size} ($mask) succeeded on $resolvedModel$fallbackTag for $sessionId (in=${resp.inputTokens} tok)"
+                        "API Key Pool pick #$slot/${maxAttemptsForModel} ($mask) succeeded on $resolvedModel$fallbackTag for $sessionId (in=${resp.inputTokens} tok)"
                     )
                     return resp to "$resolvedModel$fallbackTag:key-pool#$slot"
                 } catch (e: CancellationException) {
+                    GeminiRateLimitManager.releaseFailedSlot(prefs, reservation, keepRpmCount = false)
                     throw e
                 } catch (e: GeminiUsagePausedException) {
                     throw e
                 } catch (e: Exception) {
                     lastKeyErr = e
                     val cls = GeminiInteractionsClient.classifyApiFailure(e)
+                    // Reclaim phantom TPM tokens on failure; only keep the 1 RPM tick if Google returned 429
+                    GeminiRateLimitManager.releaseFailedSlot(
+                        prefs = prefs,
+                        reservation = reservation,
+                        keepRpmCount = cls.isQuotaOrBilling
+                    )
                     val retryAfterMs = if (cls.isQuotaOrBilling) {
                         GeminiRateLimitManager.learnFrom429Response(
                             prefs = prefs,
@@ -1391,7 +1422,7 @@ class SessionAnalyzeWorker(
                     )
                     Log.w(
                         TAG,
-                        "API Key Pool candidate #$slot/${keysToTry.size} ($mask) failed on $activeModel for $sessionId " +
+                        "API Key Pool candidate #$slot/${maxAttemptsForModel} ($mask) failed on $activeModel for $sessionId " +
                             "[${cls.category}]: ${e.message}"
                     )
                     if (cls.isQuotaOrBilling || cls.isModelUnavailable) {

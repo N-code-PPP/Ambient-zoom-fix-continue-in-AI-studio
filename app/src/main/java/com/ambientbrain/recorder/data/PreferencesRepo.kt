@@ -1446,9 +1446,10 @@ class PreferencesRepo(private val context: Context) {
                     updatedModelCooldowns[normalizedModel] = now + 30L * 60_000L
                 }
                 isRateLimit -> {
-                    // Honor Google's explicit retryDelay when provided, else progressive backoff (2m -> 5m -> 10m)
+                    // Honor Google's explicit retryDelay or Midnight PT RPD reset timestamp (up to 24h),
+                    // else progressive backoff (2m -> 5m -> 10m)
                     newStatus = ApiKeyHealth.STATUS_RATE_LIMITED
-                    val backoffMs = retryAfterMs?.coerceIn(15_000L, 15L * 60_000L) ?: when {
+                    val backoffMs = retryAfterMs?.coerceIn(15_000L, 24L * 60L * 60_000L) ?: when {
                         failures <= 1 -> 2L * 60_000L
                         failures == 2 -> 5L * 60_000L
                         else -> 10L * 60_000L
@@ -1483,6 +1484,48 @@ class PreferencesRepo(private val context: Context) {
             prefs.edit().remove(KEY_API_KEY_HEALTH_JSON).apply()
         }
     }
+
+    /**
+     * Marks all API keys available again when Google's daily quota resets at 00:00 Pacific Time
+     * (`America/Los_Angeles`), clearing daily RPD and transient rate-limit cooldowns while preserving
+     * historical lifetime success/error counters.
+     */
+    fun resetKeysForGoogleDailyReset(newPtDate: String): Int {
+        synchronized(healthLock) {
+            val map = getApiKeyHealthMap().toMutableMap()
+            var resetCount = 0
+            for ((fp, health) in map.entries.toList()) {
+                val restoredStatus = if (health.successCount > 0) {
+                    ApiKeyHealth.STATUS_HEALTHY
+                } else {
+                    ApiKeyHealth.STATUS_UNTESTED
+                }
+                val hadRestrictions = health.status != restoredStatus ||
+                    health.cooldownUntilMs > 0L ||
+                    health.modelCooldowns.isNotEmpty() ||
+                    health.consecutiveFailures > 0
+                if (hadRestrictions) {
+                    map[fp] = health.copy(
+                        status = restoredStatus,
+                        cooldownUntilMs = 0L,
+                        modelCooldowns = emptyMap(),
+                        consecutiveFailures = 0,
+                        lastErrorMessage = ""
+                    )
+                    resetCount++
+                }
+            }
+            if (resetCount > 0) {
+                saveApiKeyHealthMap(map)
+            }
+            prefs.edit().putString(KEY_LAST_RATE_LIMIT_RESET_PT_DATE, newPtDate).apply()
+            return resetCount
+        }
+    }
+
+    var lastRateLimitResetPtDate: String
+        get() = prefs.getString(KEY_LAST_RATE_LIMIT_RESET_PT_DATE, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_LAST_RATE_LIMIT_RESET_PT_DATE, value).apply()
 
     /**
      * Smart health-aware & per-model cooldown-aware key ordering for [model]:
@@ -2119,6 +2162,7 @@ class PreferencesRepo(private val context: Context) {
         private const val KEY_GEMINI_PAUSED_UNTIL_MS = "gemini_usage_paused_until_ms"
         private const val KEY_USE_DEFAULT_RATE_LIMIT_REF = "use_default_rate_limit_reference"
         private const val KEY_LIVE_RATE_LIMIT_SNAPSHOT_JSON = "live_rate_limit_snapshot_json"
+        private const val KEY_LAST_RATE_LIMIT_RESET_PT_DATE = "last_rate_limit_reset_pt_date"
 
         const val DEFAULT_MEETING_VIDEO_FOLDER = "Download/AmbientBrain"
 

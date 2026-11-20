@@ -318,7 +318,7 @@ fun GeminiRateLimitControlsCard(
                 }
             }
 
-            // Status Badges: Source + Detected Tier + Active Keys
+            // Status Badges: Source + Detected Tier + Available Keys + Dynamic Safety Margin
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -340,8 +340,25 @@ fun GeminiRateLimitControlsCard(
                     }
                 )
                 BadgePill(
-                    text = "${savedKeys.size.coerceAtLeast(0)} Key(s) in Pool",
-                    containerColor = MaterialTheme.colorScheme.surface
+                    text = "${rlTelemetry.availableKeyCount}/${savedKeys.size.coerceAtLeast(0)} Keys Avail",
+                    containerColor = if (rlTelemetry.availableKeyCount > 3) {
+                        EmeraldAccent.copy(alpha = 0.22f)
+                    } else {
+                        MaterialTheme.colorScheme.surface
+                    }
+                )
+                val isHighPoolMargin = rlTelemetry.availableKeyCount > 3
+                BadgePill(
+                    text = if (isHighPoolMargin) {
+                        "90% Margin (>3 keys)"
+                    } else {
+                        "${rlTelemetry.rpmSafetyPercent}% RPM / ${rlTelemetry.tpmSafetyPercent}% TPM"
+                    },
+                    containerColor = if (isHighPoolMargin) {
+                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.8f)
+                    } else {
+                        MaterialTheme.colorScheme.surface
+                    }
                 )
             }
 
@@ -435,18 +452,23 @@ fun GeminiRateLimitControlsCard(
                     }
 
                     // Active Pacing & Audio Batch Strategy Details
+                    val availKeysForModel = rlTelemetry.availableKeyCount
                     val (primaryProfile, tier) = remember(activeSnapshot, selectedModel, useDefaultRef) {
                         GeminiRateLimitManager.getActiveProfileForModel(prefs, selectedModel)
                     }
                     val (rawRpm, rawTpm, rawRpd) = remember(primaryProfile, tier) {
                         GeminiRateLimitManager.effectiveRawLimits(primaryProfile, tier)
                     }
-                    val safeRpmPerKey = remember(rawRpm) { GeminiRateLimitManager.safeRpmTarget(rawRpm) }
-                    val safeTpmPerKey = remember(rawTpm) { GeminiRateLimitManager.safeTpmTarget(rawTpm) }
+                    val safeRpmPerKey = remember(rawRpm, availKeysForModel) {
+                        GeminiRateLimitManager.safeRpmTarget(rawRpm, availKeysForModel)
+                    }
+                    val safeTpmPerKey = remember(rawTpm, availKeysForModel) {
+                        GeminiRateLimitManager.safeTpmTarget(rawTpm, availKeysForModel)
+                    }
                     val minSpacingSec = remember(safeRpmPerKey) {
                         GeminiRateLimitManager.minSpacingMsForRpm(safeRpmPerKey) / 1000.0
                     }
-                    val maxBatchMb = remember(activeSnapshot, selectedModel, useDefaultRef) {
+                    val maxBatchMb = remember(activeSnapshot, selectedModel, useDefaultRef, availKeysForModel) {
                         GeminiRateLimitManager.recommendedMaxAudioBatchBytes(
                             prefs = prefs,
                             modelId = selectedModel,
@@ -457,7 +479,9 @@ fun GeminiRateLimitControlsCard(
                     Text(
                         text = String.format(
                             Locale.US,
-                            "Per-key strategy: %d safe RPM (%.1fs min gap) • %s safe TPM • %d RPD • Max %.1f MB audio/batch",
+                            "Per-key strategy (%d%%/%d%%): %d safe RPM (elastic <=%.1fs gap) • %s safe TPM • %d RPD • Max %.1f MB audio/batch",
+                            rlTelemetry.rpmSafetyPercent,
+                            rlTelemetry.tpmSafetyPercent,
                             safeRpmPerKey,
                             minSpacingSec,
                             formatCompactTokens(safeTpmPerKey),
@@ -468,7 +492,19 @@ fun GeminiRateLimitControlsCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
 
+                    val resetInMs = (rlTelemetry.nextDailyResetMs - System.currentTimeMillis()).coerceAtLeast(0L)
+                    if (rlTelemetry.nextDailyResetMs > 0L) {
+                        Text(
+                            text = "Google daily RPD reset: 00:00 Pacific Time (in ${formatRemainingShort(resetInMs)}) — all keys auto-mark Available",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = EmeraldAccent
+                        )
+                    }
+
                     if (fallbackModel != PreferencesRepo.FALLBACK_MODEL_NONE && fallbackModel != selectedModel) {
+                        val fbAvailKeys = remember(activeSnapshot, fallbackModel, savedKeys.size, rlTelemetry.updatedAtMs) {
+                            GeminiRateLimitManager.countAvailableKeysForModel(prefs, fallbackModel)
+                        }
                         val (fbProfile, fbTier) = remember(activeSnapshot, fallbackModel, useDefaultRef) {
                             GeminiRateLimitManager.getActiveProfileForModel(prefs, fallbackModel)
                         }
@@ -476,7 +512,7 @@ fun GeminiRateLimitControlsCard(
                             GeminiRateLimitManager.effectiveRawLimits(fbProfile, fbTier)
                         }
                         Text(
-                            text = "Proactive failover -> $fallbackModel (${GeminiRateLimitManager.safeRpmTarget(fbRpm)} safe RPM / ${formatCompactTokens(GeminiRateLimitManager.safeTpmTarget(fbTpm))} safe TPM)",
+                            text = "Proactive failover -> $fallbackModel (${GeminiRateLimitManager.safeRpmTarget(fbRpm, fbAvailKeys)} safe RPM / ${formatCompactTokens(GeminiRateLimitManager.safeTpmTarget(fbTpm, fbAvailKeys))} safe TPM)",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.tertiary
                         )

@@ -1333,7 +1333,12 @@ fun SettingsScreen(
                                 "Invalid" to MaterialTheme.colorScheme.errorContainer
                             effectiveCooldown > nowMs -> {
                                 val minLeft = ((effectiveCooldown - nowMs + 59_999L) / 60_000L).coerceAtLeast(1L)
-                                "CD ${minLeft}m" to Color(0xFFF59E0B).copy(alpha = 0.25f)
+                                val cdLabel = if (minLeft >= 60L) {
+                                    "RPD ${minLeft / 60L}h ${minLeft % 60L}m"
+                                } else {
+                                    "CD ${minLeft}m"
+                                }
+                                cdLabel to Color(0xFFF59E0B).copy(alpha = 0.25f)
                             }
                             health.status == ApiKeyHealth.STATUS_HEALTHY ->
                                 "OK (${health.successCount})" to Color(0xFF10B981).copy(alpha = 0.22f)
