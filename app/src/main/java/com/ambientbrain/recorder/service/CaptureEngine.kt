@@ -1086,9 +1086,9 @@ class CaptureEngine(private val context: Context) {
             }
             if (callGuard.externalRecordingActive &&
                 (mode == MicSharingMode.STRICT_YIELD || !callGuard.isInCallMode) &&
-                !(stealthParallel && callGuard.isExternalClientExemptedStealth)
+                !(stealthParallel && (callGuard.isExternalClientExemptedStealth || callGuard.isStealthInspectionPending))
             ) {
-                val resolution = if (!callGuard.isInCallMode) {
+                val resolution = if (!callGuard.isInCallMode || stealthParallel) {
                     CaptureEngineController.noteExternalConflictForForegroundApp(
                         context = context,
                         shizukuClient = callGuard.lastShizukuExternalClient
@@ -1101,7 +1101,9 @@ class CaptureEngine(private val context: Context) {
                     is CaptureEngineController.ExternalConflictResolution.YieldToApp ->
                         return "Yielded to ${resolution.label}"
                     CaptureEngineController.ExternalConflictResolution.UnknownExternalClient ->
-                        return "Yielded to another app"
+                        if (!(stealthParallel && callGuard.isInCallMode && AmbientCaptureAccessibilityService.isSystemBound)) {
+                            return "Yielded to another app"
+                        }
                 }
             }
             val checkSilence = (mode == MicSharingMode.STRICT_YIELD && !(stealthParallel && AmbientCaptureAccessibilityService.isSystemBound)) ||
@@ -1165,9 +1167,9 @@ class CaptureEngine(private val context: Context) {
             }
             if (callGuard.externalRecordingActive &&
                 (mode == MicSharingMode.STRICT_YIELD || !callGuard.isInCallMode) &&
-                !(stealthParallel && callGuard.isExternalClientExemptedStealth)
+                !(stealthParallel && (callGuard.isExternalClientExemptedStealth || callGuard.isStealthInspectionPending))
             ) {
-                val resolution = if (!callGuard.isInCallMode) {
+                val resolution = if (!callGuard.isInCallMode || stealthParallel) {
                     CaptureEngineController.noteExternalConflictForForegroundApp(
                         context = context,
                         shizukuClient = callGuard.lastShizukuExternalClient
@@ -1180,7 +1182,9 @@ class CaptureEngine(private val context: Context) {
                     is CaptureEngineController.ExternalConflictResolution.YieldToApp ->
                         return "Yielded to ${resolution.label}"
                     CaptureEngineController.ExternalConflictResolution.UnknownExternalClient ->
-                        return "Yielded to another app"
+                        if (!(stealthParallel && callGuard.isInCallMode && AmbientCaptureAccessibilityService.isSystemBound)) {
+                            return "Yielded to another app"
+                        }
                 }
             }
             if (nowMonoMs < cooldownUntilMonoMs) {
@@ -1391,12 +1395,19 @@ class CaptureEngine(private val context: Context) {
 
         callGuard.onRecordingStateChanged = {
             val mode = prefs.micSharingMode
+            val stealthParallel = MeetingRecorderStateBus.isStealthParallelAmbientActive()
+            val callModeShouldYield = mode == MicSharingMode.STRICT_YIELD &&
+                callGuard.isInCallMode &&
+                !(stealthParallel && AmbientCaptureAccessibilityService.isSystemBound)
+            val externalShouldYield = callGuard.externalRecordingActive &&
+                (mode == MicSharingMode.STRICT_YIELD || !callGuard.isInCallMode) &&
+                !(stealthParallel && (callGuard.isExternalClientExemptedStealth || callGuard.isStealthInspectionPending || callGuard.isInCallMode))
             val shouldNudgeImmediately = CaptureEngineController.externalPauseReason != null ||
                 CaptureEngineController.isUserManualPaused() ||
                 (mode != MicSharingMode.FORCE_CONCURRENT && (
                     CaptureEngineController.getActiveYieldForegroundLabel() != null ||
-                        (mode == MicSharingMode.STRICT_YIELD && callGuard.isInCallMode) ||
-                        (callGuard.externalRecordingActive && (mode == MicSharingMode.STRICT_YIELD || !callGuard.isInCallMode))
+                        callModeShouldYield ||
+                        externalShouldYield
                     ))
             if (shouldNudgeImmediately) {
                 CaptureEngineController.requestMicNudgeFromCallback(this@CaptureEngine)
@@ -1510,6 +1521,12 @@ class CaptureEngine(private val context: Context) {
                 val alignedBytes = bytesRead and 0x7FFFFFFE // Ensure even number of bytes for 16-bit PCM
                 if (alignedBytes <= 0) {
                     bufferPool.returnFreeBuffer(directBuf)
+                    if (activeRecord.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                        Log.w(TAG, "AudioRecord stopped unexpectedly (state=${activeRecord.recordingState}) -> reopening stream")
+                        releaseMicHardwareNow()
+                        callGuard.needsStreamReopen = true
+                        delay(60L)
+                    }
                     continue
                 }
 

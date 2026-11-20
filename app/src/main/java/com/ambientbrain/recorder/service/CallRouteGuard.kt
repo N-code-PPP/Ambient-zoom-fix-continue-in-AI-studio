@@ -120,12 +120,18 @@ class CallRouteGuard(context: Context) {
         }.also { shizukuInspectExecutor = it }
     }
 
-    private fun scheduleShizukuMicOwnerInspection(configs: List<AudioRecordingConfiguration>) {
+    val isStealthInspectionPending: Boolean
+        get() = shizukuInspectInFlight.get()
+
+    private fun scheduleShizukuMicOwnerInspection(
+        configs: List<AudioRecordingConfiguration>,
+        bypassCooldown: Boolean = false
+    ) {
         if (ShizukuAdbManager.getShizukuStatus(appContext) != ShizukuStatus.AUTHORIZED) {
             return
         }
         val nowMono = SystemClock.elapsedRealtime()
-        if (nowMono - lastShizukuInspectMonoMs < SHIZUKU_INSPECT_COOLDOWN_MS) {
+        if (!bypassCooldown && nowMono - lastShizukuInspectMonoMs < SHIZUKU_INSPECT_COOLDOWN_MS) {
             return
         }
         if (!shizukuInspectInFlight.compareAndSet(false, true)) {
@@ -283,7 +289,10 @@ class CallRouteGuard(context: Context) {
                 isExternalClientExemptedStealth = false
             }
             if (silencedChanged || externalChanged || lastShizukuExternalClient == null) {
-                scheduleShizukuMicOwnerInspection(configs)
+                scheduleShizukuMicOwnerInspection(
+                    configs = configs,
+                    bypassCooldown = stealthParallel && externalChanged
+                )
             }
         }
 

@@ -35,6 +35,9 @@ import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -700,9 +703,9 @@ object AdbVirtualDisplayRunner {
 
             val minBuf = AudioRecord.getMinBufferSize(
                 sampleRateHz,
-                AudioFormat.CHANNEL_IN_STEREO,
+                inChMask,
                 AudioFormat.ENCODING_PCM_16BIT
-            ).coerceAtLeast(sampleRateHz / 25 * 4)
+            ).coerceAtLeast(sampleRateHz / 25 * maxOf(1, channelCount) * 2)
 
             val builder = AudioRecord.Builder()
                 .setContext(shellContext)
@@ -1263,8 +1266,7 @@ object AdbVirtualDisplayRunner {
         val bufferInfo = MediaCodec.BufferInfo()
         var videoTrackIndex = -1
         var firstInputPtsUs = -1L
-        var pausedAccumulatedUs = 0L
-        var pauseStartPtsUs = -1L
+        var videoInitialOffsetUs = 0L
         var lastWrittenPtsUs = -1L
         var eosWaitTicks = 0
 
@@ -1310,31 +1312,33 @@ object AdbVirtualDisplayRunner {
                     if (muxerStarted.get() && videoTrackIndex >= 0) {
                         val rawPtsUs = bufferInfo.presentationTimeUs
                         if (firstInputPtsUs < 0L) {
+                            val nowMonoMs = SystemClock.elapsedRealtime()
                             firstInputPtsUs = rawPtsUs
-                            // Anchor shared t=0 timeline on first video frame so both video & audio start at PTS = 0
-                            if (mediaTimelineAnchorMonoMs.compareAndSet(0L, SystemClock.elapsedRealtime())) {
+                            // Anchor shared t=0 timeline on first video frame; if audio already latched after
+                            // the 4s fallback (e.g. user moved app to Virtual Display later), offset video PTS
+                            // so audio and video remain synchronized.
+                            if (mediaTimelineAnchorMonoMs.compareAndSet(0L, nowMonoMs)) {
                                 pausedAtAnchorMs.set(accumulatedPausedMs.get())
+                                videoInitialOffsetUs = 0L
+                            } else {
+                                val anchorMono = mediaTimelineAnchorMonoMs.get()
+                                val pausedSinceAnchorMs = (accumulatedPausedMs.get() - pausedAtAnchorMs.get()).coerceAtLeast(0L)
+                                videoInitialOffsetUs = ((nowMonoMs - anchorMono - pausedSinceAnchorMs).coerceAtLeast(0L)) * 1_000L
                             }
                         }
 
                         if (paused.get()) {
-                            if (pauseStartPtsUs < 0L) {
-                                pauseStartPtsUs = rawPtsUs
-                            }
+                            // Drop frames during active pause; shared accumulatedPausedMs tracks exact pause duration
                         } else if (awaitingSyncFrameAfterResume.get() && !isKeyFrame) {
-                            // Drop inter-predicted P-frames after Resume until clean IDR keyframe arrives
-                            if (pauseStartPtsUs < 0L) {
-                                pauseStartPtsUs = rawPtsUs
-                            }
+                            // Drop inter-predicted P-frames after Resume until a clean IDR keyframe arrives
                         } else {
                             if (awaitingSyncFrameAfterResume.get() && isKeyFrame) {
                                 awaitingSyncFrameAfterResume.set(false)
                             }
-                            if (pauseStartPtsUs >= 0L) {
-                                pausedAccumulatedUs += (rawPtsUs - pauseStartPtsUs).coerceAtLeast(0L)
-                                pauseStartPtsUs = -1L
-                            }
-                            var adjustedPtsUs = (rawPtsUs - firstInputPtsUs - pausedAccumulatedUs).coerceAtLeast(0L)
+                            // Use the exact same shared accumulatedPausedMs clock as audio so waiting for
+                            // an IDR keyframe after Resume never introduces cumulative A/V drift.
+                            val sharedPausedUs = ((accumulatedPausedMs.get() - pausedAtAnchorMs.get()).coerceAtLeast(0L)) * 1_000L
+                            var adjustedPtsUs = (videoInitialOffsetUs + (rawPtsUs - firstInputPtsUs) - sharedPausedUs).coerceAtLeast(0L)
                             if (lastWrittenPtsUs >= 0L && adjustedPtsUs <= lastWrittenPtsUs) {
                                 adjustedPtsUs = lastWrittenPtsUs + 1_000L
                             }
@@ -1378,12 +1382,24 @@ object AdbVirtualDisplayRunner {
         var decoder: MediaCodec? = null
         var lastDecodedSeq = -1L
         var lastSyncReqMonoMs = 0L
+        var previewFrameCounter = 0L
+        var lastPreviewDir: File? = null
+        var lastPreviewBaseName: String? = null
 
         fun releaseDecoder() {
             val dec = decoder ?: return
             decoder = null
             runCatching { dec.stop() }
             runCatching { dec.release() }
+        }
+
+        fun cleanupPreviewTmpFiles() {
+            val dir = lastPreviewDir ?: return
+            val prefix = lastPreviewBaseName ?: return
+            runCatching {
+                dir.listFiles { f -> f.name.startsWith("$prefix.") && f.name.endsWith(".tmp") }
+                    ?.forEach { runCatching { it.delete() } }
+            }
         }
 
         try {
@@ -1417,24 +1433,7 @@ object AdbVirtualDisplayRunner {
                 }
 
                 if (decoder == null) {
-                    decoder = runCatching {
-                        val width = srcFmt.getInteger(MediaFormat.KEY_WIDTH)
-                        val height = srcFmt.getInteger(MediaFormat.KEY_HEIGHT)
-                        val decFmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-                            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-                            setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-                            srcFmt.getByteBuffer("csd-0")?.let { csd0 ->
-                                setByteBuffer("csd-0", cloneByteBuffer(csd0))
-                            }
-                            srcFmt.getByteBuffer("csd-1")?.let { csd1 ->
-                                setByteBuffer("csd-1", cloneByteBuffer(csd1))
-                            }
-                        }
-                        val dec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-                        dec.configure(decFmt, null, null, 0)
-                        dec.start()
-                        dec
-                    }.getOrNull()
+                    decoder = configurePreviewDecoderWithFallback(srcFmt)?.first
                 }
 
                 val activeDec = decoder
@@ -1443,7 +1442,11 @@ object AdbVirtualDisplayRunner {
                     continue
                 }
 
-                val ok = decodeKeyframeToJpeg(activeDec, snap.bytes, File(outPath))
+                val outFile = File(outPath)
+                lastPreviewDir = outFile.parentFile
+                lastPreviewBaseName = outFile.name
+                val ptsUs = (++previewFrameCounter) * 33_333L
+                val ok = decodeKeyframeToJpeg(activeDec, snap.bytes, ptsUs, outFile)
                 if (ok) {
                     lastDecodedSeq = snap.seq
                     emitLine("PREVIEW_FRAME:${System.currentTimeMillis()}")
@@ -1459,7 +1462,37 @@ object AdbVirtualDisplayRunner {
             }
         } finally {
             releaseDecoder()
+            cleanupPreviewTmpFiles()
         }
+    }
+
+    private fun configurePreviewDecoderWithFallback(srcFmt: MediaFormat): Pair<MediaCodec, Boolean>? {
+        val width = srcFmt.getInteger(MediaFormat.KEY_WIDTH)
+        val height = srcFmt.getInteger(MediaFormat.KEY_HEIGHT)
+        for (tryLowLatency in listOf(true, false)) {
+            var dec: MediaCodec? = null
+            try {
+                val decFmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                    setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+                    if (tryLowLatency) {
+                        setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                    }
+                    srcFmt.getByteBuffer("csd-0")?.let { csd0 ->
+                        setByteBuffer("csd-0", cloneByteBuffer(csd0))
+                    }
+                    srcFmt.getByteBuffer("csd-1")?.let { csd1 ->
+                        setByteBuffer("csd-1", cloneByteBuffer(csd1))
+                    }
+                }
+                dec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                dec.configure(decFmt, null, null, 0)
+                dec.start()
+                return dec to tryLowLatency
+            } catch (_: Throwable) {
+                runCatching { dec?.release() }
+            }
+        }
+        return null
     }
 
     private fun cloneByteBuffer(src: ByteBuffer): ByteBuffer {
@@ -1470,7 +1503,12 @@ object AdbVirtualDisplayRunner {
         return ByteBuffer.wrap(arr)
     }
 
-    private fun decodeKeyframeToJpeg(decoder: MediaCodec, idrBytes: ByteArray, outFile: File): Boolean {
+    private fun decodeKeyframeToJpeg(
+        decoder: MediaCodec,
+        idrBytes: ByteArray,
+        ptsUs: Long,
+        outFile: File
+    ): Boolean {
         return try {
             val inIdx = decoder.dequeueInputBuffer(30_000L)
             if (inIdx < 0) return false
@@ -1478,18 +1516,22 @@ object AdbVirtualDisplayRunner {
             inBuf.clear()
             if (inBuf.capacity() < idrBytes.size) return false
             inBuf.put(idrBytes)
-            decoder.queueInputBuffer(inIdx, 0, idrBytes.size, 0L, MediaCodec.BUFFER_FLAG_KEY_FRAME)
+            decoder.queueInputBuffer(inIdx, 0, idrBytes.size, ptsUs, MediaCodec.BUFFER_FLAG_KEY_FRAME)
 
-            // Queue EOS immediately so hardware decoders that buffer 1 frame flush this IDR right away
+            // Queue EOS to force hardware decoders with 1-frame reorder queues to emit immediately,
+            // then drain through EOS cleanly before calling flush().
             val eosIdx = decoder.dequeueInputBuffer(30_000L)
+            var queuedEos = false
             if (eosIdx >= 0) {
-                decoder.queueInputBuffer(eosIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                decoder.queueInputBuffer(eosIdx, 0, 0, ptsUs + 1_000L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                queuedEos = true
             }
 
             val info = MediaCodec.BufferInfo()
             var wrote = false
+            var sawEos = false
             var attempts = 0
-            while (attempts < 15) {
+            while (attempts < 18) {
                 val outIdx = decoder.dequeueOutputBuffer(info, 25_000L)
                 if (outIdx >= 0) {
                     if (!wrote && info.size > 0) {
@@ -1503,12 +1545,19 @@ object AdbVirtualDisplayRunner {
                         }
                     }
                     decoder.releaseOutputBuffer(outIdx, false)
-                    if (wrote || (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
+                    if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                        sawEos = true
+                        break
+                    }
+                    if (wrote && !queuedEos) break
                 } else if (outIdx == MediaCodec.INFO_TRY_AGAIN_LATER) {
                     attempts++
+                    if (wrote && attempts >= 3) break
                 }
             }
-            decoder.flush()
+            if (queuedEos || !sawEos) {
+                decoder.flush()
+            }
             wrote
         } catch (_: Throwable) {
             false
@@ -1583,15 +1632,32 @@ object AdbVirtualDisplayRunner {
         if (!yuv.compressToJpeg(Rect(0, 0, dstW, dstH), 68, baos)) return false
 
         outFile.parentFile?.mkdirs()
-        val tmpFile = File(outFile.parentFile, "${outFile.name}.tmp")
-        FileOutputStream(tmpFile, false).use { fos ->
-            fos.write(baos.toByteArray())
-            fos.flush()
-        }
-        return tmpFile.renameTo(outFile) || run {
-            tmpFile.copyTo(outFile, overwrite = true)
-            tmpFile.delete()
-            outFile.exists()
+        val tmpFile = File(outFile.parentFile, "${outFile.name}.${System.nanoTime()}.tmp")
+        return try {
+            FileOutputStream(tmpFile, false).use { fos ->
+                fos.write(baos.toByteArray())
+                fos.flush()
+            }
+            val movedAtomically = runCatching {
+                Files.move(
+                    tmpFile.toPath(),
+                    outFile.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING
+                )
+                true
+            }.getOrDefault(false)
+            if (movedAtomically) {
+                true
+            } else if (tmpFile.renameTo(outFile)) {
+                true
+            } else {
+                // Never truncate outFile in place (causes torn JPEGs); skip this frame cleanly
+                runCatching { tmpFile.delete() }
+                false
+            }
+        } catch (_: Throwable) {
+            runCatching { tmpFile.delete() }
+            false
         }
     }
 
@@ -1658,6 +1724,43 @@ object AdbVirtualDisplayRunner {
                     val id = vdRes.virtualDisplay.display?.displayId ?: -1
                     val status = if (vdRes.tierName == "FULL_TRUSTED_ALWAYS_UNLOCKED") "PASS" else "WARN"
                     emitLine("SELFTEST_ITEM:VIRTUAL_DISPLAY:$status:Created display #$id (${vdRes.tierName}) + H.264 surface OK")
+
+                    // 2b. Verify `input -d <id>` touch/key injection against the live virtual display
+                    if (id > 0) {
+                        val injectOk = try {
+                            val proc = ProcessBuilder("input", "-d", id.toString(), "keyevent", "0")
+                                .redirectErrorStream(true)
+                                .start()
+                            val done = proc.waitFor(3, TimeUnit.SECONDS)
+                            if (!done) {
+                                runCatching { proc.destroyForcibly() }
+                                false
+                            } else {
+                                proc.exitValue() == 0
+                            }
+                        } catch (_: Throwable) {
+                            false
+                        }
+                        if (injectOk) {
+                            emitLine("SELFTEST_ITEM:TOUCH_INJECT:PASS:input -d #$id accepted remote input injection")
+                        } else {
+                            emitLine("SELFTEST_ITEM:TOUCH_INJECT:WARN:input -d #$id rejected or timed out (touch forwarding in mini-preview may be restricted on this ROM)")
+                        }
+                    }
+
+                    // 2c. Verify AVC preview decoder configures cleanly (with automatic KEY_LOW_LATENCY fallback)
+                    val probeFmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 720, 1280)
+                    val decRes = configurePreviewDecoderWithFallback(probeFmt)
+                    if (decRes != null) {
+                        val (probeDec, lowLatUsed) = decRes
+                        runCatching { probeDec.stop() }
+                        runCatching { probeDec.release() }
+                        emitLine(
+                            "SELFTEST_ITEM:PREVIEW_DECODER:PASS:H.264 preview decoder ready (lowLatency=$lowLatUsed)"
+                        )
+                    } else {
+                        emitLine("SELFTEST_ITEM:PREVIEW_DECODER:WARN:AVC decoder probe failed — mini-preview image may not render")
+                    }
                 } catch (t: Throwable) {
                     emitLine("SELFTEST_ITEM:VIRTUAL_DISPLAY:FAIL:${t.message ?: t.javaClass.simpleName}")
                 } finally {

@@ -775,6 +775,16 @@ object AdbVirtualScreenController {
                 missingDetail = "VirtualDisplay probe timed out or crashed (exit=$code)."
             )
             addParsedCheck(
+                key = "TOUCH_INJECT",
+                title = "Remote Touch Injection (input -d)",
+                missingDetail = "Touch injection probe did not complete on the virtual display."
+            )
+            addParsedCheck(
+                key = "PREVIEW_DECODER",
+                title = "Mini-Preview H.264 Decoder",
+                missingDetail = "Preview AVC decoder probe did not complete."
+            )
+            addParsedCheck(
                 key = "SPEAKER_LOOPBACK",
                 title = "Per-UID Silent Speaker Loopback",
                 missingDetail = "Speaker loopback AudioPolicy probe did not complete."
@@ -904,6 +914,13 @@ object AdbVirtualScreenController {
         val exited = runCatching { session.process.waitFor(2, TimeUnit.SECONDS) }.getOrDefault(false)
         if (!exited) {
             runCatching { session.process.destroyForcibly() }
+        }
+        session.previewFile?.let { pFile ->
+            runCatching {
+                pFile.parentFile?.listFiles { f ->
+                    f.name.startsWith("${pFile.name}.") && f.name.endsWith(".tmp")
+                }?.forEach { runCatching { it.delete() } }
+            }
         }
         val hasVideo = session.tempVideoFile.exists() && session.tempVideoFile.length() > 1024L
         val hasAudio = session.tempAudioFile != null && session.tempAudioFile.exists() && session.tempAudioFile.length() > 1024L

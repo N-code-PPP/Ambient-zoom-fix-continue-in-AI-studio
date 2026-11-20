@@ -1030,13 +1030,21 @@ class MeetingRecorderService : Service() {
                 displayId = targetDisplayId,
                 launchIfNotRunning = toVirtual
             )
-            if (!toVirtual && !ok) {
+            if (!toVirtual) {
                 Handler(Looper.getMainLooper()).post {
-                    Toast.makeText(
-                        applicationContext,
-                        "$activeTargetAppLabel task wasn't found running — not relaunched to avoid interrupting calls.",
-                        Toast.LENGTH_LONG
-                    ).show()
+                    if (ok) {
+                        Toast.makeText(
+                            applicationContext,
+                            "Brought $activeTargetAppLabel back to main screen.",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    } else {
+                        Toast.makeText(
+                            applicationContext,
+                            "$activeTargetAppLabel task wasn't found running — not relaunched to avoid interrupting calls.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
                 }
             }
             MeetingRecorderStateBus.update { st ->
@@ -1417,6 +1425,7 @@ class MeetingRecorderService : Service() {
                         micSilencedByOs = activeCaptureMode.needsMic && micSilencedFlag.get()
                     )
                 }
+                miniPreviewOverlay?.updateElapsedText(formatDuration(elapsedSec))
             }
 
             notifTickCounter++

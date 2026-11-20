@@ -168,6 +168,7 @@ class AmbientCaptureAccessibilityService : AccessibilityService() {
         captureEngine?.stop(persistDisabled = false)
         captureEngine = null
         removeOverlay()
+        notifyAccessibilityUnbound()
         CaptureStateBus.update {
             it.copy(
                 status = LiveCaptureStatus.STOPPED,
@@ -196,6 +197,7 @@ class AmbientCaptureAccessibilityService : AccessibilityService() {
         captureEngine?.stop(persistDisabled = false)
         captureEngine = null
         removeOverlay()
+        notifyAccessibilityUnbound()
         syncA11yTelemetry()
         super.onDestroy()
     }
@@ -381,6 +383,13 @@ class AmbientCaptureAccessibilityService : AccessibilityService() {
         @Volatile
         var instance: AmbientCaptureAccessibilityService? = null
             private set
+
+        @Volatile
+        var onAccessibilityUnbound: (() -> Unit)? = null
+
+        private fun notifyAccessibilityUnbound() {
+            runCatching { onAccessibilityUnbound?.invoke() }
+        }
 
         fun startListening(context: Context): Boolean {
             val prefs = PreferencesRepo(context)

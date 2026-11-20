@@ -467,26 +467,96 @@ object ShizukuAdbManager {
         return executeShizukuProcess(command)
     }
 
+    private data class ProcessExecResult(
+        val exitCode: Int,
+        val stdout: String,
+        val stderr: String,
+        val timedOut: Boolean
+    )
+
+    private fun readBoundedStream(stream: java.io.InputStream, maxBytes: Int = 256 * 1024): String {
+        val baos = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(4096)
+        var total = 0
+        try {
+            stream.use { input ->
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    val remaining = maxBytes - total
+                    if (remaining > 0) {
+                        val toWrite = minOf(n, remaining)
+                        baos.write(buf, 0, toWrite)
+                        total += toWrite
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+            // Stream closed on forcible process termination
+        }
+        return baos.toString(Charsets.UTF_8.name()).trim()
+    }
+
+    private fun runProcessWithTimeout(
+        proc: java.lang.Process,
+        timeoutSec: Long
+    ): ProcessExecResult {
+        val outRef = java.util.concurrent.atomic.AtomicReference("")
+        val errRef = java.util.concurrent.atomic.AtomicReference("")
+        val outThread = Thread({
+            outRef.set(readBoundedStream(proc.inputStream))
+        }, "Shizuku-Stdout").apply {
+            isDaemon = true
+            start()
+        }
+        val errThread = Thread({
+            errRef.set(readBoundedStream(proc.errorStream))
+        }, "Shizuku-Stderr").apply {
+            isDaemon = true
+            start()
+        }
+
+        val finished = proc.waitFor(timeoutSec.coerceAtLeast(2L), TimeUnit.SECONDS)
+        if (!finished) {
+            runCatching { proc.destroyForcibly() }
+            runCatching { proc.inputStream.close() }
+            runCatching { proc.errorStream.close() }
+            runCatching { outThread.join(300L) }
+            runCatching { errThread.join(300L) }
+            return ProcessExecResult(
+                exitCode = -1,
+                stdout = outRef.get(),
+                stderr = errRef.get(),
+                timedOut = true
+            )
+        }
+
+        runCatching { outThread.join(500L) }
+        runCatching { errThread.join(500L) }
+        return ProcessExecResult(
+            exitCode = proc.exitValue(),
+            stdout = outRef.get(),
+            stderr = errRef.get(),
+            timedOut = false
+        )
+    }
+
     internal fun runShizukuShellCommand(command: String, timeoutSec: Long = 10L): Pair<Int, String> {
         return try {
             val proc = executeShizukuProcess(command)
-            val out = proc.inputStream.bufferedReader().readText().trim()
-            val err = proc.errorStream.bufferedReader().readText().trim()
-            val finished = proc.waitFor(timeoutSec.coerceAtLeast(2L), TimeUnit.SECONDS)
-            val code = if (finished) {
-                proc.exitValue()
-            } else {
-                runCatching { proc.destroyForcibly() }
-                -1
-            }
+            val res = runProcessWithTimeout(proc, timeoutSec)
             val combined = buildString {
-                if (out.isNotEmpty()) append(out)
-                if (err.isNotEmpty()) {
+                if (res.stdout.isNotEmpty()) append(res.stdout)
+                if (res.stderr.isNotEmpty()) {
                     if (isNotEmpty()) append("\n")
-                    append(err)
+                    append(res.stderr)
+                }
+                if (res.timedOut) {
+                    if (isNotEmpty()) append("\n")
+                    append("Timed out after ${timeoutSec.coerceAtLeast(2L)}s")
                 }
             }
-            code to combined
+            res.exitCode to combined
         } catch (t: Throwable) {
             -1 to (t.message ?: t.javaClass.simpleName)
         }
@@ -1027,15 +1097,11 @@ object ShizukuAdbManager {
                 logBuilder.append("[").append(spec.label).append("]\n")
                 logBuilder.append("> ").append(spec.command).append("\n")
                 val process = executeShizukuProcess(spec.command)
-                val out = process.inputStream.bufferedReader().readText().trim()
-                val err = process.errorStream.bufferedReader().readText().trim()
-                val finished = process.waitFor(15, TimeUnit.SECONDS)
-                val code = if (finished) {
-                    process.exitValue()
-                } else {
-                    runCatching { process.destroyForcibly() }
-                    -1
-                }
+                val execRes = runProcessWithTimeout(process, timeoutSec = 15L)
+                val out = execRes.stdout
+                val err = execRes.stderr
+                val finished = !execRes.timedOut
+                val code = execRes.exitCode
                 if (out.isNotEmpty()) logBuilder.append(out).append("\n")
                 if (!finished) {
                     logBuilder.append("Timed out after 15s\n")

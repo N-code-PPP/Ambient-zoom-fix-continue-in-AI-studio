@@ -685,11 +685,6 @@ fun MeetingRecorderDialog(
                             },
                             onBringToMainScreen = {
                                 MeetingRecorderService.bringMeetingAppToMainScreen(context)
-                                Toast.makeText(
-                                    context,
-                                    "Bringing ${meetingState.effectiveShortAppName()} back to main screen...",
-                                    Toast.LENGTH_SHORT
-                                ).show()
                             },
                             onToggleMiniPreview = {
                                 MeetingRecorderService.toggleMiniPreview(context)

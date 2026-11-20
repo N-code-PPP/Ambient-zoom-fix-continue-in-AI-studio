@@ -50,13 +50,18 @@ class StealthMiniPreviewOverlay(
     private val onDismissed: () -> Unit
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val ioExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "StealthPreview-IO").apply { isDaemon = true }
+    private val previewExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "StealthPreview-Decode").apply { isDaemon = true }
+    }
+    private val inputExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "StealthPreview-Input").apply { isDaemon = true }
     }
 
     private val isAttached = AtomicBoolean(false)
     private val isDismissed = AtomicBoolean(false)
     private val decodePending = AtomicBoolean(false)
+    private var usingA11yOverlay: Boolean = false
+    private var a11yUnbindHook: (() -> Unit)? = null
 
     private var windowManager: WindowManager? = null
     private var layoutParams: WindowManager.LayoutParams? = null
@@ -97,6 +102,7 @@ class StealthMiniPreviewOverlay(
         }
 
         windowManager = wm
+        usingA11yOverlay = windowType == WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
         isCollapsed = startCollapsed
 
         val params = WindowManager.LayoutParams(
@@ -124,6 +130,16 @@ class StealthMiniPreviewOverlay(
                 wm.addView(root, params)
                 isAttached.set(true)
                 builtSuccess.set(true)
+                if (usingA11yOverlay) {
+                    val hook = {
+                        if (!isDismissed.get()) {
+                            Log.w(TAG, "AccessibilityService unbound while using TYPE_ACCESSIBILITY_OVERLAY -> dismissing preview cleanly")
+                            dismiss(notifyCallback = true)
+                        }
+                    }
+                    a11yUnbindHook = hook
+                    AmbientCaptureAccessibilityService.onAccessibilityUnbound = hook
+                }
                 Log.i(TAG, "Stealth mini-preview attached (type=$windowType, display=#${session.displayId})")
             } catch (t: Throwable) {
                 Log.e(TAG, "Failed attaching Stealth mini-preview overlay", t)
@@ -166,7 +182,7 @@ class StealthMiniPreviewOverlay(
         if (!decodePending.compareAndSet(false, true)) return
 
         runCatching {
-            ioExecutor.execute {
+            previewExecutor.execute {
                 try {
                     if (isDismissed.get() || isCollapsed || !file.exists() || file.length() < 64L) {
                         return@execute
@@ -201,6 +217,11 @@ class StealthMiniPreviewOverlay(
 
     fun dismiss(notifyCallback: Boolean = true) {
         if (!isDismissed.compareAndSet(false, true)) return
+        val hook = a11yUnbindHook
+        a11yUnbindHook = null
+        if (hook != null && AmbientCaptureAccessibilityService.onAccessibilityUnbound === hook) {
+            AmbientCaptureAccessibilityService.onAccessibilityUnbound = null
+        }
         // Always stop runner preview decoder immediately
         runCatching {
             AdbVirtualScreenController.sendCommand(session, "PREVIEW_OFF")
@@ -229,7 +250,8 @@ class StealthMiniPreviewOverlay(
                 runCatching { onDismissed() }
             }
         }
-        runCatching { ioExecutor.shutdownNow() }
+        runCatching { previewExecutor.shutdownNow() }
+        runCatching { inputExecutor.shutdownNow() }
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -296,14 +318,14 @@ class StealthMiniPreviewOverlay(
         val collapseBtn = buildIconChipButton("−", "Minimize preview") {
             applyCollapsedState(collapsed = true, notifyRunner = true)
         }
-        headerRow.addView(collapseBtn, LinearLayout.LayoutParams(dp(34), dp(34)).apply {
+        headerRow.addView(collapseBtn, LinearLayout.LayoutParams(dp(40), dp(40)).apply {
             marginStart = dp(4)
         })
 
         val closeBtn = buildIconChipButton("✕", "Close preview", accentDanger = true) {
             dismiss(notifyCallback = true)
         }
-        headerRow.addView(closeBtn, LinearLayout.LayoutParams(dp(34), dp(34)).apply {
+        headerRow.addView(closeBtn, LinearLayout.LayoutParams(dp(40), dp(40)).apply {
             marginStart = dp(4)
         })
 
@@ -417,14 +439,14 @@ class StealthMiniPreviewOverlay(
                     AdbVirtualScreenController.injectKeyEvent(context, session.displayId, KeyEvent.KEYCODE_BACK)
                 }
             },
-            LinearLayout.LayoutParams(0, dp(34), 1f).apply { marginEnd = dp(3) }
+            LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginEnd = dp(3) }
         )
         actionRow.addView(
             buildActionChip("Snap") {
                 updateStatusHint("Refreshing frame...")
                 requestRunnerSnap()
             },
-            LinearLayout.LayoutParams(0, dp(34), 1f).apply { marginEnd = dp(3) }
+            LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginEnd = dp(3) }
         )
         actionRow.addView(
             buildActionChip("Virtual") {
@@ -432,14 +454,14 @@ class StealthMiniPreviewOverlay(
                 onSendToVirtual()
                 mainHandler.postDelayed({ requestRunnerSnap() }, 500L)
             },
-            LinearLayout.LayoutParams(0, dp(34), 1f).apply { marginEnd = dp(3) }
+            LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginEnd = dp(3) }
         )
         actionRow.addView(
             buildActionChip("Main") {
                 updateStatusHint("Moving to main screen...")
                 onBringToMain()
             },
-            LinearLayout.LayoutParams(0, dp(34), 1f)
+            LinearLayout.LayoutParams(0, dp(40), 1f)
         )
 
         card.addView(actionRow, LinearLayout.LayoutParams(vpW, LinearLayout.LayoutParams.WRAP_CONTENT))
@@ -480,12 +502,12 @@ class StealthMiniPreviewOverlay(
         val expandBtn = buildIconChipButton("⤢", "Expand preview") {
             applyCollapsedState(collapsed = false, notifyRunner = true)
         }
-        pill.addView(expandBtn, LinearLayout.LayoutParams(dp(34), dp(34)).apply { marginStart = dp(8) })
+        pill.addView(expandBtn, LinearLayout.LayoutParams(dp(40), dp(40)).apply { marginStart = dp(8) })
 
         val pillCloseBtn = buildIconChipButton("✕", "Close preview", accentDanger = true) {
             dismiss(notifyCallback = true)
         }
-        pill.addView(pillCloseBtn, LinearLayout.LayoutParams(dp(34), dp(34)).apply { marginStart = dp(4) })
+        pill.addView(pillCloseBtn, LinearLayout.LayoutParams(dp(40), dp(40)).apply { marginStart = dp(4) })
         collapsedPill = pill
 
         root.addView(card)
@@ -516,7 +538,7 @@ class StealthMiniPreviewOverlay(
     private fun dispatchVirtualInput(label: String, action: () -> Boolean) {
         updateStatusHint("Sending $label...")
         runCatching {
-            ioExecutor.execute {
+            inputExecutor.execute {
                 val ok = runCatching { action() }.getOrDefault(false)
                 if (!isDismissed.get()) {
                     mainHandler.post {
