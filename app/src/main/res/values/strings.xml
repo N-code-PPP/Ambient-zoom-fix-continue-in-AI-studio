@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Ambient Brain</string>
+    <string name="accessibility_service_label">Ambient Brain Continuous Capture Keeper</string>
+    <string name="accessibility_service_description">Maintains continuous hands-free ambient and medical round voice capture, including during phone calls and across system reboots.</string>
+</resources>

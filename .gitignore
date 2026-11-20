@@ -1,0 +1,27 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+build/
+/build
+app/build/
+.build-outputs/
+.kotlin/
+.aistudio/
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+debug.keystore
+debug.keystore.base64
+
+# Do NOT ignore release keystore, google-services.json, or gradle-wrapper.jar
+!/app/release.keystore
+!/app/google-services.json
+!/gradle/wrapper/gradle-wrapper.jar

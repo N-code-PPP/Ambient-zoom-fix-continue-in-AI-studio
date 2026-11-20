@@ -1,0 +1,4 @@
+-keep class com.ambientbrain.recorder.ai.** { *; }
+-keep class com.ambientbrain.recorder.data.** { *; }
+-keepattributes *Annotation*, InnerClasses
+-dontnote kotlinx.serialization.**

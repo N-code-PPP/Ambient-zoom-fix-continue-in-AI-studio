@@ -1,0 +1,440 @@
+name: Build Android APK & Publish Release
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      include_debug:
+        description: 'Also build Debug APK (slower, adds ~3 min)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build & Package APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Gradle & Build Cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-cleanup: on-success
+
+      - name: Accept Android SDK Licenses & Ensure SDK 35
+        run: |
+          set +o pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export ANDROID_HOME="$SDK_ROOT"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+
+          if [ -d "$SDK_ROOT/platforms/android-35" ] && [ -d "$SDK_ROOT/build-tools/35.0.0" ] && [ -f "$SDK_ROOT/licenses/android-sdk-license" ]; then
+            echo "Android SDK 35, build-tools 35.0.0, and licenses already installed; skipping sdkmanager."
+            exit 0
+          fi
+
+          SDKMANAGER=""
+          for candidate in \
+            "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "$SDK_ROOT/cmdline-tools/bin/sdkmanager" \
+            "$SDK_ROOT/tools/bin/sdkmanager" \
+            "$(command -v sdkmanager 2>/dev/null || true)"; do
+            if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+              SDKMANAGER="$candidate"
+              break
+            fi
+          done
+
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+            if [ ! -d "$SDK_ROOT/platforms/android-35" ] || [ ! -d "$SDK_ROOT/build-tools/35.0.0" ]; then
+              yes | "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
+            fi
+          fi
+          set -o pipefail
+
+      - name: Verify & Self-Heal Keystore, Wrapper & Resource Files
+        env:
+          CI_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          CI_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          CI_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if grep -q $'\r' ./gradlew 2>/dev/null; then
+            sed -i 's/\r$//' ./gradlew
+          fi
+          chmod +x ./gradlew
+
+          # 1. Verify all PNG files in app/src/main/res; repair if corrupted by text sync
+          python3 - << 'PY'
+          import glob, struct, zlib
+
+          def is_valid_png(path):
+              try:
+                  with open(path, "rb") as f:
+                      data = f.read()
+                  if len(data) < 33 or data[:8] != b"\x89PNG\r\n\x1a\n":
+                      return False
+                  pos = 8
+                  idat = bytearray()
+                  saw_iend = False
+                  while pos + 8 <= len(data):
+                      length = struct.unpack(">I", data[pos:pos+4])[0]
+                      ctype = data[pos+4:pos+8]
+                      if pos + 12 + length > len(data):
+                          return False
+                      chunk_data = data[pos+8:pos+8+length]
+                      crc_expected = struct.unpack(">I", data[pos+8+length:pos+12+length])[0]
+                      crc_actual = zlib.crc32(ctype + chunk_data) & 0xffffffff
+                      if crc_expected != crc_actual:
+                          return False
+                      if ctype == b"IDAT":
+                          idat.extend(chunk_data)
+                      elif ctype == b"IEND":
+                          saw_iend = True
+                          break
+                      pos += 12 + length
+                  if not saw_iend or not idat:
+                      return False
+                  zlib.decompress(bytes(idat))
+                  return True
+              except Exception:
+                  return False
+
+          def write_clean_png(path, size=108):
+              def chunk(ctype, cdata):
+                  return struct.pack(">I", len(cdata)) + ctype + cdata + struct.pack(">I", zlib.crc32(ctype + cdata) & 0xffffffff)
+              ihdr = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
+              raw = bytearray()
+              cx = cy = size / 2.0
+              r_outer = size * 0.34
+              r_inner = size * 0.18
+              for y in range(size):
+                  raw.append(0)
+                  for x in range(size):
+                      dx = x - cx
+                      dy = y - cy
+                      d2 = dx * dx + dy * dy
+                      if d2 <= r_inner * r_inner:
+                          raw.extend((0, 229, 255, 255))
+                      elif d2 <= r_outer * r_outer:
+                          raw.extend((19, 36, 58, 255))
+                      else:
+                          raw.extend((11, 19, 30, 255))
+              png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b"")
+              with open(path, "wb") as f:
+                  f.write(png)
+
+          for p in sorted(glob.glob("app/src/main/res/**/*.png", recursive=True)):
+              if not is_valid_png(p):
+                  print(f"Repairing corrupted PNG resource: {p}")
+                  write_clean_png(p, 108)
+          PY
+
+          # 3. Verify app/release.keystore integrity; restore from base64 or keytool if corrupted/missing
+          STORE_PASS="${CI_KEYSTORE_PASSWORD:-ambientbrain123}"
+          ALIAS_NAME="${CI_KEY_ALIAS:-ambientbrain}"
+          KEY_PASS="${CI_KEY_PASSWORD:-ambientbrain123}"
+
+          if [ ! -f app/release.keystore ] || ! keytool -list -keystore app/release.keystore -storepass "$STORE_PASS" >/dev/null 2>&1; then
+            echo "Restoring app/release.keystore..."
+            cat << 'B64' | tr -d ' \t\r\n' | base64 -d > app/release.keystore
+          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
+          B64
+          fi
+
+          if ! keytool -list -keystore app/release.keystore -storepass "$STORE_PASS" >/dev/null 2>&1; then
+            echo "Generating fresh PKCS12 keystore matching configured credentials..."
+            rm -f app/release.keystore
+            keytool -genkeypair -v \
+              -keystore app/release.keystore \
+              -storetype PKCS12 \
+              -alias "$ALIAS_NAME" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "$STORE_PASS" \
+              -keypass "$KEY_PASS" \
+              -dname "CN=Ambient Brain, OU=Mobile, O=AmbientBrain, L=Bangkok, ST=Bangkok, C=TH"
+          fi
+
+          echo "Release keystore certificate fingerprints:"
+          keytool -list -v -keystore app/release.keystore -alias "$ALIAS_NAME" -storepass "$STORE_PASS" 2>/dev/null | grep -E "SHA1:|SHA256:" || true
+
+          # 3. Verify gradle-wrapper.jar integrity; regenerate if corrupted/missing
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ] || ! unzip -tq gradle/wrapper/gradle-wrapper.jar >/dev/null 2>&1; then
+            echo "Regenerating clean gradle-wrapper.jar..."
+            mkdir -p /tmp/gw-bootstrap gradle/wrapper
+            touch /tmp/gw-bootstrap/settings.gradle.kts
+            gradle -p /tmp/gw-bootstrap wrapper --gradle-version 8.9 --no-daemon
+            cp /tmp/gw-bootstrap/gradle/wrapper/gradle-wrapper.jar gradle/wrapper/gradle-wrapper.jar
+            rm -rf /tmp/gw-bootstrap
+          fi
+
+      - name: Build APK(s)
+        env:
+          CI_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          CI_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          CI_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          INCLUDE_DEBUG: ${{ inputs.include_debug == true }}
+        run: |
+          if [ -n "${CI_KEYSTORE_PASSWORD}" ]; then export KEYSTORE_PASSWORD="${CI_KEYSTORE_PASSWORD}"; fi
+          if [ -n "${CI_KEY_ALIAS}" ]; then export KEY_ALIAS="${CI_KEY_ALIAS}"; fi
+          if [ -n "${CI_KEY_PASSWORD}" ]; then export KEY_PASSWORD="${CI_KEY_PASSWORD}"; fi
+
+          TASKS="assembleRelease"
+          if [ "${INCLUDE_DEBUG}" = "true" ]; then
+            TASKS="assembleRelease assembleDebug"
+          fi
+          echo "Running Gradle tasks: ${TASKS}"
+
+          if [ -f gradle/wrapper/gradle-wrapper.jar ] && unzip -tq gradle/wrapper/gradle-wrapper.jar >/dev/null 2>&1; then
+            ./gradlew ${TASKS} --build-cache --parallel --stacktrace --no-daemon
+          else
+            gradle ${TASKS} --build-cache --parallel --stacktrace --no-daemon
+          fi
+
+      - name: Prepare APK Artifacts (No Double Zip)
+        id: package_apk
+        env:
+          INCLUDE_DEBUG: ${{ inputs.include_debug == true }}
+        run: |
+          COMMIT_ID=$(git rev-parse --short HEAD)
+          rm -rf staging
+          mkdir -p staging
+
+          mapfile -d '' REL_APKS < <(find app/build/outputs/apk/release -type f -name "*.apk" -print0 2>/dev/null | sort -z)
+          REL_APK="${REL_APKS[0]:-}"
+
+          if [ -z "$REL_APK" ] || [ ! -f "$REL_APK" ]; then
+            echo "::error::Release APK was not generated under app/build/outputs/apk/release"
+            exit 1
+          fi
+          cp "$REL_APK" "staging/ambient-brain-${COMMIT_ID}-release.apk"
+
+          HAS_DEBUG="false"
+          if [ "${INCLUDE_DEBUG}" = "true" ]; then
+            mapfile -d '' DBG_APKS < <(find app/build/outputs/apk/debug -type f -name "*.apk" -print0 2>/dev/null | sort -z)
+            DBG_APK="${DBG_APKS[0]:-}"
+            if [ -z "$DBG_APK" ] || [ ! -f "$DBG_APK" ]; then
+              echo "::error::Debug APK was not generated under app/build/outputs/apk/debug"
+              exit 1
+            fi
+            cp "$DBG_APK" "staging/ambient-brain-${COMMIT_ID}-debug.apk"
+            HAS_DEBUG="true"
+          fi
+
+          {
+            echo "Project: Ambient Brain (Android)"
+            echo "Commit ID: ${GITHUB_SHA}"
+            echo "Commit Short: ${COMMIT_ID}"
+            echo "Ref: ${GITHUB_REF}"
+            echo "Build Time UTC: $(date -u)"
+            echo "Target Platform: Modern Android (Android 14+, arm64-v8a)"
+          } > staging/BUILD_INFO.txt
+
+          echo "commit_id=${COMMIT_ID}" >> "$GITHUB_OUTPUT"
+          echo "has_debug=${HAS_DEBUG}" >> "$GITHUB_OUTPUT"
+          ls -lh staging/
+
+      - name: Calculate Next Release Tag (1.01, 1.02, ...)
+        id: next_tag
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - << 'PY'
+          import subprocess, re, os, json
+
+          repo = os.environ.get("GH_REPO", "")
+          subprocess.run(["git", "fetch", "--tags", "--force"], capture_output=True)
+          tags = set()
+
+          res_local = subprocess.run(["git", "tag", "-l"], capture_output=True, text=True)
+          for line in res_local.stdout.splitlines():
+              t = line.strip()
+              if t:
+                  tags.add(t)
+
+          res_remote = subprocess.run(["git", "ls-remote", "--tags", "origin"], capture_output=True, text=True)
+          for line in res_remote.stdout.splitlines():
+              parts = line.strip().split("\t")
+              if len(parts) == 2 and parts[1].startswith("refs/tags/"):
+                  t = parts[1][len("refs/tags/"):].removesuffix("^{}")
+                  if t:
+                      tags.add(t)
+
+          gh_cmd = ["gh", "release", "list", "--limit", "1000", "--json", "tagName"]
+          if repo:
+              gh_cmd.extend(["--repo", repo])
+          gh_res = subprocess.run(gh_cmd, capture_output=True, text=True)
+          if gh_res.returncode == 0 and gh_res.stdout.strip():
+              try:
+                  for item in json.loads(gh_res.stdout):
+                      t = item.get("tagName", "").strip()
+                      if t:
+                          tags.add(t)
+              except Exception:
+                  pass
+
+          max_num = 0
+          for t in tags:
+              m = re.match(r"^v?1\.(\d+)$", t)
+              if m:
+                  num = int(m.group(1))
+                  if num > max_num:
+                      max_num = num
+
+          next_num = max_num + 1 if max_num >= 1 else 1
+          next_tag = f"1.{next_num:02d}"
+          while next_tag in tags:
+              next_num += 1
+              next_tag = f"1.{next_num:02d}"
+
+          print(f"Existing tags/releases count: {len(tags)}")
+          print(f"Calculated next tag: {next_tag}")
+
+          github_output = os.environ.get("GITHUB_OUTPUT")
+          if not github_output:
+              raise RuntimeError("GITHUB_OUTPUT is not set")
+          with open(github_output, "a", encoding="utf-8") as f:
+              f.write(f"tag={next_tag}\n")
+          PY
+
+      - name: Create GitHub Release & Attach APK Files
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.next_tag.outputs.tag }}
+          COMMIT_ID: ${{ steps.package_apk.outputs.commit_id }}
+          HAS_DEBUG: ${{ steps.package_apk.outputs.has_debug }}
+        run: |
+          if [ -z "$TAG" ]; then
+            echo "::error::Calculated release tag is empty"
+            exit 1
+          fi
+
+          FILES=()
+          for f in staging/*.apk; do
+            if [ -f "$f" ]; then
+              FILES+=("$f")
+            fi
+          done
+
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "::error::No APK files found in staging/ to attach to release"
+            exit 1
+          fi
+
+          python3 - << 'PY'
+          import os
+          tag = os.environ["TAG"]
+          commit_id = os.environ["COMMIT_ID"]
+          sha = os.environ.get("GITHUB_SHA", commit_id)
+          repo = os.environ.get("GH_REPO", "")
+          has_debug = os.environ.get("HAS_DEBUG") == "true"
+
+          links = [
+              f"- **[Download Signed Release APK (arm64-v8a)](https://github.com/{repo}/releases/download/{tag}/ambient-brain-{commit_id}-release.apk)** (Recommended for 24/7 background capture)"
+          ]
+          assets = [f"- `ambient-brain-{commit_id}-release.apk`"]
+          if has_debug:
+              links.append(
+                  f"- **[Download Debug APK](https://github.com/{repo}/releases/download/{tag}/ambient-brain-{commit_id}-debug.apk)**"
+              )
+              assets.append(f"- `ambient-brain-{commit_id}-debug.apk`")
+
+          notes = (
+              f"### 🧠 Ambient Brain Release {tag}\n"
+              f"**Target Platform:** Modern Android (Android 14+, arm64-v8a)\n"
+              f"**Commit:** `{sha}` (`{commit_id}`)\n\n"
+              f"#### 📲 Direct 1-Tap APK Downloads (No Zip Extraction Needed):\n"
+              + "\n".join(links) + "\n\n"
+              f"#### 📦 Direct APK Assets Attached:\n"
+              + "\n".join(assets) + "\n\n"
+              f"*Direct raw .apk files attached without zip compression for instant Android package installer launch.*\n"
+          )
+          with open("/tmp/RELEASE_NOTES.md", "w", encoding="utf-8") as f:
+              f.write(notes)
+          PY
+
+          RELEASE_TITLE="Release ${TAG} (${COMMIT_ID})"
+          echo "Publishing release $TAG with title '$RELEASE_TITLE' and direct APK files: ${FILES[*]}"
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --clobber --repo "$GH_REPO"
+          else
+            gh release create "$TAG" "${FILES[@]}" \
+              --repo "$GH_REPO" \
+              --title "$RELEASE_TITLE" \
+              --notes-file /tmp/RELEASE_NOTES.md \
+              --target "$GITHUB_SHA"
+          fi
