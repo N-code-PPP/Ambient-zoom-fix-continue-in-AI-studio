@@ -278,6 +278,9 @@ fun SettingsScreen(
     val recentFailedRuns by remember(appDao) {
         appDao.observeRecentFailedAnalysisRuns(3)
     }.collectAsState(initial = emptyList())
+    val queuedSessionsCount by remember(appDao) {
+        appDao.observeQueuedSessionsCount()
+    }.collectAsState(initial = 0)
 
     fun commitPendingEdits() {
         if (apiKey.isNotBlank()) {
@@ -1680,6 +1683,15 @@ fun SettingsScreen(
                 }
             }
         }
+
+        // 2a. Temporary Pause Gemini AI + Adaptive RPM/TPM Rate-Limit Strategy
+        GeminiRateLimitControlsCard(
+            prefs = prefs,
+            selectedModel = selectedModel,
+            fallbackModel = fallbackModel,
+            savedKeys = savedKeys,
+            queuedSessionsCount = queuedSessionsCount
+        )
 
         // 2b. AI Usage, Latency & Pool Health Dashboard
         Card(

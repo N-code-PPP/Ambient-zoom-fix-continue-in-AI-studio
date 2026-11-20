@@ -74,12 +74,43 @@ class SessionAnalyzeWorker(
         val isTemporaryChunk: Boolean
     )
 
+    private class GeminiUsagePausedException(val resumeAtMs: Long = 0L) : Exception("Gemini usage is temporarily paused.")
+
+    private suspend fun handlePausedSession(session: SessionEntity, mode: AnalysisMode): Result {
+        val until = prefs.geminiPausedUntilMs
+        val now = System.currentTimeMillis()
+        val msg = if (until > now) {
+            val minsLeft = ((until - now + 59_999L) / 60_000L).coerceAtLeast(1L)
+            "Gemini AI paused (~${minsLeft}m left) • Audio stored safely • Auto-resumes automatically"
+        } else {
+            "Gemini AI paused by user • Audio stored safely • Resume Gemini to analyze"
+        }
+        db.upsertSession(
+            session.copy(
+                status = Status.QUEUED,
+                nextRetryEpochMs = if (until > now) until else 0L,
+                lastError = msg
+            )
+        )
+        if (until > now) {
+            val delayMin = ((until - now + 59_999L) / 60_000L).coerceAtLeast(1L)
+            scheduleRetry(applicationContext, session.id, delayMin, mode)
+        }
+        return Result.success()
+    }
+
     override suspend fun doWork(): Result {
         val sessionId = inputData.getString(KEY_SESSION_ID) ?: return Result.failure()
         val modeStr = inputData.getString(KEY_ANALYSIS_MODE) ?: AnalysisMode.INFO_EXTRACTION_EN.name
         val analysisMode = runCatching { AnalysisMode.valueOf(modeStr) }
             .getOrDefault(AnalysisMode.INFO_EXTRACTION_EN)
         val session = db.getSessionById(sessionId) ?: return Result.failure()
+
+        // Respect temporary Gemini AI pause immediately before doing any cloud work
+        if (prefs.isGeminiUsagePausedNow()) {
+            Log.i(TAG, "Gemini usage is paused; deferring session $sessionId safely in QUEUED state.")
+            return handlePausedSession(session, analysisMode)
+        }
 
         val combinedIds: List<String> = session.combinedSourceIdsJson?.let { raw ->
             runCatching { json.decodeFromString<List<String>>(raw) }.getOrNull()
@@ -183,7 +214,12 @@ class SessionAnalyzeWorker(
             .distinctBy { it.entry.id }
             .map { it.entry.effectiveNickname() to it.entry.effectiveRelatableTitle() }
         val referenceVoiceBytes = referenceVoices.sumOf { it.file.length() }
-        val maxAudioBatchBytes = (PRIMARY_INLINE_TOTAL_LIMIT - referenceVoiceBytes).coerceAtLeast(6_000_000L)
+        val inlineLimitBytes = (PRIMARY_INLINE_TOTAL_LIMIT - referenceVoiceBytes).coerceAtLeast(6_000_000L)
+        val maxAudioBatchBytes = GeminiRateLimitManager.recommendedMaxAudioBatchBytes(
+            prefs = prefs,
+            modelId = prefs.geminiModel,
+            baseLimitBytes = inlineLimitBytes
+        )
 
         // Prepare chunked/indexed audio parts while preserving clean ADTS frame boundaries
         val tempChunkFiles = mutableListOf<File>()
@@ -787,6 +823,9 @@ class SessionAnalyzeWorker(
             Result.success()
         } catch (e: CancellationException) {
             throw e
+        } catch (e: GeminiUsagePausedException) {
+            Log.i(TAG, "Gemini paused mid-run for session $sessionId; preserving safely in QUEUED state.")
+            handlePausedSession(session, analysisMode)
         } catch (e: Exception) {
             Log.e(TAG, "Analysis failed for session $sessionId", e)
             val currentAttempt = session.retryCount + 1
@@ -1176,6 +1215,9 @@ class SessionAnalyzeWorker(
             Result.success()
         } catch (e: CancellationException) {
             throw e
+        } catch (e: GeminiUsagePausedException) {
+            Log.i(TAG, "Gemini paused during extracted-info review for $sessionId; preserving QUEUED.")
+            handlePausedSession(session, AnalysisMode.AI_REVIEW_EXTRACTED_ONLY)
         } catch (e: Exception) {
             Log.e(TAG, "Extracted-info AI Review failed for $sessionId", e)
             val currentAttempt = session.retryCount + 1
@@ -1240,16 +1282,23 @@ class SessionAnalyzeWorker(
     }
 
     /**
-     * Routes Gemini API calls strictly through the user's saved Google AI Studio API Key Pool:
-     *  - Prioritizes healthy/untested keys not in cooldown for the target model (cryptographically shuffled)
-     *  - Records per-key & per-model health/cooldown telemetry after every attempt
-     *  - Automatically fails over from Primary Model (`prefs.geminiModel`) to Fallback Model
-     *    (`prefs.fallbackGeminiModel`) when the pool hits quota (429), Paid-only limits, or 404.
+     * Routes Gemini API calls through the user's Google AI Studio API Key Pool using
+     * [GeminiRateLimitManager]'s adaptive RPM/TPM strategy:
+     *  - Checks temporary Gemini pause state before every request
+     *  - Picks the least-loaded healthy key with immediate RPM + TPM headroom
+     *  - Smoothly paces requests to stay below safe RPM/TPM ceilings instead of hitting 429
+     *  - Proactively shifts to Fallback Model when Primary Model's 60s window is saturated
+     *  - Reconciles actual `usageMetadata` tokens and auto-calibrates on 429 responses
      */
     private suspend fun executeWithApiKeyPool(
         sessionId: String,
+        estimatedInputTokens: Long,
         callApiKey: suspend (apiKey: String, model: String, strictModelOnly: Boolean) -> GeminiCallResponse
     ): Pair<GeminiCallResponse, String> {
+        if (prefs.isGeminiUsagePausedNow()) {
+            throw GeminiUsagePausedException(prefs.geminiPausedUntilMs)
+        }
+
         val orderedPool = prefs.getAllApiKeys()
         if (orderedPool.isEmpty()) {
             throw IllegalStateException(
@@ -1266,36 +1315,79 @@ class SessionAnalyzeWorker(
         var lastKeyErr: Exception? = null
 
         for ((modelIdx, activeModel) in modelsToTry.withIndex()) {
-            val keysToTry = prefs.getPrioritizedApiKeysForModel(activeModel)
+            val hasNextFallback = modelIdx == 0 && hasFallback
+            val strategy = GeminiRateLimitManager.planRequestStrategy(
+                prefs = prefs,
+                model = activeModel,
+                estimatedInputTokens = estimatedInputTokens,
+                hasFallbackModel = hasNextFallback
+            )
+
+            if (hasNextFallback && strategy.recommendProactiveFallback) {
+                Log.i(TAG, "Rate-limit strategy proactively routing $sessionId to fallback '$fallbackModel': ${strategy.strategyNote}")
+                continue
+            }
+
+            val keysToTry = strategy.orderedKeys
             val strictModel = modelIdx == 0 && hasFallback
             var sawQuotaBillingOrUnavailable = false
             var sawNetworkOffline = false
 
             for ((attemptIdx, keyCandidate) in keysToTry.withIndex()) {
+                if (prefs.isGeminiUsagePausedNow()) {
+                    throw GeminiUsagePausedException(prefs.geminiPausedUntilMs)
+                }
+
                 val slot = orderedPool.indexOf(keyCandidate).let { if (it >= 0) it + 1 else attemptIdx + 1 }
                 val mask = if (keyCandidate.length > 10) {
                     "${keyCandidate.take(6)}...${keyCandidate.takeLast(4)}"
                 } else "Key #$slot"
                 try {
+                    GeminiRateLimitManager.acquireSlotBeforeCall(
+                        prefs = prefs,
+                        apiKey = keyCandidate,
+                        model = activeModel,
+                        estimatedInputTokens = estimatedInputTokens
+                    )
+                    if (prefs.isGeminiUsagePausedNow()) {
+                        throw GeminiUsagePausedException(prefs.geminiPausedUntilMs)
+                    }
                     val resp = callApiKey(keyCandidate, activeModel, strictModel)
                     val resolvedModel = resp.actualModel.ifBlank { activeModel }
                     prefs.recordApiKeySuccess(keyCandidate, resolvedModel)
+                    GeminiRateLimitManager.recordActualTokensCompleted(
+                        prefs = prefs,
+                        apiKey = keyCandidate,
+                        model = resolvedModel,
+                        actualInputTokens = resp.inputTokens
+                    )
                     val fallbackTag = if (modelIdx > 0) " (fallback)" else ""
                     Log.i(
                         TAG,
-                        "API Key Pool pick #$slot/${keysToTry.size} ($mask) succeeded on $resolvedModel$fallbackTag for $sessionId"
+                        "API Key Pool pick #$slot/${keysToTry.size} ($mask) succeeded on $resolvedModel$fallbackTag for $sessionId (in=${resp.inputTokens} tok)"
                     )
                     return resp to "$resolvedModel$fallbackTag:key-pool#$slot"
                 } catch (e: CancellationException) {
                     throw e
+                } catch (e: GeminiUsagePausedException) {
+                    throw e
                 } catch (e: Exception) {
                     lastKeyErr = e
                     val cls = GeminiInteractionsClient.classifyApiFailure(e)
+                    val retryAfterMs = if (cls.isQuotaOrBilling) {
+                        GeminiRateLimitManager.learnFrom429Response(
+                            prefs = prefs,
+                            apiKey = keyCandidate,
+                            model = activeModel,
+                            errorMessage = e.message.orEmpty()
+                        )
+                    } else null
                     prefs.recordApiKeyFailure(
                         key = keyCandidate,
                         model = activeModel,
                         failureCategory = cls.category,
-                        errorMsg = e.message ?: cls.category
+                        errorMsg = e.message ?: cls.category,
+                        retryAfterMs = retryAfterMs
                     )
                     Log.w(
                         TAG,
@@ -1337,7 +1429,11 @@ class SessionAnalyzeWorker(
         sessionContextText: String,
         extractedDocument: String
     ): Pair<GeminiCallResponse, String> {
-        return executeWithApiKeyPool(sessionId = sessionId) { apiKey, activeModel, strictModel ->
+        val estTokens = GeminiRateLimitManager.estimateInputTokens(
+            systemInstruction = systemInstruction,
+            promptText = "$sessionContextText\n$extractedDocument"
+        )
+        return executeWithApiKeyPool(sessionId = sessionId, estimatedInputTokens = estTokens) { apiKey, activeModel, strictModel ->
             client.analyzeExtractedInfo(
                 apiKey = apiKey,
                 model = activeModel,
@@ -1405,7 +1501,13 @@ class SessionAnalyzeWorker(
         audioParts: List<AudioPartInput>,
         referenceVoices: List<ReferenceVoiceInput>
     ): Pair<GeminiCallResponse, String> {
-        return executeWithApiKeyPool(sessionId = sessionId) { apiKey, activeModel, strictModel ->
+        val estTokens = GeminiRateLimitManager.estimateInputTokens(
+            systemInstruction = systemInstruction,
+            promptText = sessionContextText,
+            audioFiles = audioParts.map { it.file },
+            referenceVoiceFiles = referenceVoices.map { it.file }
+        )
+        return executeWithApiKeyPool(sessionId = sessionId, estimatedInputTokens = estTokens) { apiKey, activeModel, strictModel ->
             client.analyzeMultiAudio(
                 apiKey = apiKey,
                 model = activeModel,
@@ -1592,6 +1694,17 @@ class SessionAnalyzeWorker(
             sessionId: String,
             mode: AnalysisMode = AnalysisMode.INFO_EXTRACTION_EN
         ) {
+            val prefs = PreferencesRepo(context)
+            if (prefs.isGeminiUsagePausedNow()) {
+                val until = prefs.geminiPausedUntilMs
+                val now = System.currentTimeMillis()
+                if (until > now) {
+                    val delayMin = ((until - now + 59_999L) / 60_000L).coerceAtLeast(1L)
+                    scheduleRetry(context, sessionId, delayMin, mode)
+                }
+                return
+            }
+
             val constraints = Constraints.Builder()
                 .setRequiredNetworkType(NetworkType.CONNECTED)
                 .build()
@@ -1870,6 +1983,28 @@ class SessionAnalyzeWorker(
                             s.copy(
                                 status = Status.QUEUED,
                                 retryCount = 0,
+                                nextRetryEpochMs = 0L,
+                                lastError = null
+                            )
+                        )
+                        enqueueImmediate(context, s.id, AnalysisMode.INFO_EXTRACTION_EN)
+                    }
+                }
+            }
+        }
+
+        /**
+         * Dispatches all sessions that waited safely in `QUEUED` while Gemini usage was paused.
+         */
+        fun resumeAllQueuedAfterUnpause(context: Context) {
+            val db = AppDatabase.get(context).dao()
+            CoroutineScope(Dispatchers.IO).launch {
+                val queuedSessions = db.getQueuedSessions()
+                for (s in queuedSessions) {
+                    val rawFile = s.rawPath?.let { File(it) }
+                    if (!s.combinedSourceIdsJson.isNullOrBlank() || (rawFile != null && rawFile.exists())) {
+                        db.upsertSession(
+                            s.copy(
                                 nextRetryEpochMs = 0L,
                                 lastError = null
                             )

@@ -315,6 +315,25 @@ interface AppDao {
 
     @Query(
         """
+        SELECT * FROM sessions
+        WHERE status = 'QUEUED'
+          AND (rawPath IS NOT NULL OR combinedSourceIdsJson IS NOT NULL)
+        ORDER BY startMs ASC
+        """
+    )
+    suspend fun getQueuedSessions(): List<SessionEntity>
+
+    @Query(
+        """
+        SELECT COUNT(*) FROM sessions
+        WHERE status = 'QUEUED'
+          AND (rawPath IS NOT NULL OR combinedSourceIdsJson IS NOT NULL)
+        """
+    )
+    fun observeQueuedSessionsCount(): Flow<Int>
+
+    @Query(
+        """
         UPDATE sessions
         SET status = 'QUEUED', retryCount = 0, nextRetryEpochMs = 0, lastError = NULL
         WHERE id = :sessionId

@@ -2,6 +2,8 @@ package com.ambientbrain.recorder.ai
 
 import android.util.Base64
 import android.util.Log
+import com.ambientbrain.recorder.data.GeminiRateLimitProfile
+import com.ambientbrain.recorder.data.GeminiRateLimitSnapshot
 import com.ambientbrain.recorder.data.ModelAllowanceEntry
 import com.ambientbrain.recorder.data.PreferencesRepo
 import kotlinx.coroutines.CancellationException
@@ -28,6 +30,9 @@ import java.io.File
 import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
@@ -1264,6 +1269,268 @@ class GeminiInteractionsClient {
         }
 
         results
+    }
+
+    /**
+     * Checks live Gemini rate limits directly from Google using two complementary live sources:
+     *  1. Official Google AI Gemini Rate Limits docs (`https://ai.google.dev/gemini-api/docs/rate-limits`)
+     *     to extract any updated published RPM / TPM / RPD numbers per model.
+     *  2. Live Gemini REST API (`GET /v1beta/models` + tiny 2-token probes on user's saved key pool)
+     *     to verify real `inputTokenLimit`, live rate-limit headers (`x-ratelimit-*`), 429 `quotaValue`
+     *     payloads, and whether the account is **Free Tier** vs **Paid Tier 1+**.
+     *
+     * Merges live findings cleanly over the Nov 20, 2026 baseline so every model stays covered.
+     */
+    suspend fun checkLiveRateLimitsFromGoogle(
+        apiKeys: List<String>,
+        primaryModel: String,
+        onProgress: ((String) -> Unit)? = null
+    ): GeminiRateLimitSnapshot = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        val cleanKeys = apiKeys.map { it.trim() }.filter { it.isNotBlank() }.distinct()
+        val baselineById = GeminiRateLimitManager.getDefaultNov2026Profiles()
+            .associateBy { it.modelId.lowercase() }
+            .toMutableMap()
+
+        var docsParsedModels = 0
+        var apiModelsListed = 0
+        var headersDetected = false
+        var detectedTier = GeminiRateLimitSnapshot.TIER_FREE
+        val notes = mutableListOf<String>()
+
+        // 1. Live fetch of Google's published Gemini rate limits reference page
+        onProgress?.invoke("Fetching Google official Gemini rate-limit docs...")
+        runCatching {
+            val docsReq = Request.Builder()
+                .url("https://ai.google.dev/gemini-api/docs/rate-limits")
+                .addHeader("User-Agent", "Mozilla/5.0 (Android 15; AmbientBrain)")
+                .get()
+                .build()
+            httpClient.newCall(docsReq).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val html = resp.body?.string().orEmpty()
+                    val parsed = parseGoogleRateLimitDocsHtml(html)
+                    for ((modelKey, triple) in parsed) {
+                        val existing = baselineById[modelKey] ?: GeminiRateLimitManager.getDefaultProfileForModel(modelKey)
+                        val (rpm, tpm, rpd) = triple
+                        baselineById[modelKey] = existing.copy(
+                            freeRpm = rpm ?: existing.freeRpm,
+                            freeTpm = tpm ?: existing.freeTpm,
+                            freeRpd = rpd ?: existing.freeRpd,
+                            source = GeminiRateLimitProfile.SOURCE_GOOGLE_LIVE
+                        )
+                        docsParsedModels++
+                    }
+                    if (docsParsedModels > 0) {
+                        notes.add("Docs parsed $docsParsedModels model(s)")
+                    }
+                }
+            }
+        }.onFailure { e ->
+            Log.w(TAG, "Official rate-limits page fetch skipped: ${e.message}")
+        }
+
+        // 2. Live query of /v1beta/models to capture live inputTokenLimit & active account models
+        if (cleanKeys.isNotEmpty()) {
+            onProgress?.invoke("Querying Google /v1beta/models for token limits...")
+            for (key in cleanKeys.take(2)) {
+                val ok = runCatching {
+                    val req = Request.Builder()
+                        .url("$BASE_URL/v1beta/models?key=$key")
+                        .get()
+                        .build()
+                    httpClient.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) return@use false
+                        val body = resp.body?.string().orEmpty()
+                        val root = json.parseToJsonElement(body) as? JsonObject ?: return@use false
+                        val arr = root["models"] as? JsonArray ?: return@use false
+                        for (el in arr) {
+                            val obj = el as? JsonObject ?: continue
+                            val name = obj["name"]?.jsonPrimitive?.content?.removePrefix("models/")?.trim().orEmpty()
+                            if (name.isBlank() || !isEligibleMultimodalModelName(name)) continue
+                            val methods = (obj["supportedGenerationMethods"] as? JsonArray)
+                                ?.mapNotNull { it.jsonPrimitive.content }
+                                .orEmpty()
+                            if ("generateContent" !in methods) continue
+                            val inLimit = obj["inputTokenLimit"]?.jsonPrimitive?.content?.toLongOrNull() ?: 1_048_576L
+                            val keyLower = name.lowercase()
+                            val existing = baselineById[keyLower] ?: GeminiRateLimitManager.getDefaultProfileForModel(name)
+                            baselineById[keyLower] = existing.copy(
+                                modelId = name,
+                                inputTokenLimit = inLimit,
+                                source = GeminiRateLimitProfile.SOURCE_GOOGLE_LIVE
+                            )
+                            apiModelsListed++
+                        }
+                        true
+                    }
+                }.getOrDefault(false)
+                if (ok) break
+            }
+            if (apiModelsListed > 0) {
+                notes.add("API verified $apiModelsListed active model(s)")
+            }
+
+            // 3. Live probe for Account Tier (Free vs Paid Tier 1+) & HTTP rate-limit headers / 429 quotaValue
+            val tinyPayload = buildJsonObject {
+                putJsonArray("contents") {
+                    add(buildJsonObject {
+                        putJsonArray("parts") {
+                            add(buildJsonObject { put("text", "Hi") })
+                        }
+                    })
+                }
+                putJsonObject("generationConfig") {
+                    put("max_output_tokens", 2)
+                }
+            }.toString()
+
+            val probeKey = cleanKeys.first()
+            val probeTargets = listOf(
+                PreferencesRepo.normalizeSupportedModel(primaryModel),
+                "gemini-4-argon",
+                "gemini-4-carbon"
+            ).distinct()
+
+            for (probeModel in probeTargets) {
+                onProgress?.invoke("Probing Google quota & tier on $probeModel...")
+                runCatching {
+                    val req = Request.Builder()
+                        .url("$BASE_URL/v1beta/models/$probeModel:generateContent?key=$probeKey")
+                        .addHeader("Content-Type", "application/json")
+                        .post(tinyPayload.toRequestBody(JSON_MEDIA_TYPE))
+                        .build()
+                    httpClient.newCall(req).execute().use { resp ->
+                        val bodyStr = resp.body?.string().orEmpty()
+                        val bodyLower = bodyStr.lowercase()
+                        val keyLower = probeModel.lowercase()
+                        val existing = baselineById[keyLower] ?: GeminiRateLimitManager.getDefaultProfileForModel(probeModel)
+
+                        // Inspect any rate-limit headers returned by Google edge proxies
+                        val hdrRpm = (resp.header("x-ratelimit-limit-requests")
+                            ?: resp.header("x-goog-ratelimit-limit-requests"))?.toIntOrNull()
+                        val hdrTpm = (resp.header("x-ratelimit-limit-tokens")
+                            ?: resp.header("x-goog-ratelimit-limit-tokens"))?.toLongOrNull()
+                        if (hdrRpm != null || hdrTpm != null) {
+                            headersDetected = true
+                            val updated = if (detectedTier == GeminiRateLimitSnapshot.TIER_PAID_1) {
+                                existing.copy(
+                                    paidRpm = hdrRpm ?: existing.paidRpm,
+                                    paidTpm = hdrTpm ?: existing.paidTpm,
+                                    source = GeminiRateLimitProfile.SOURCE_GOOGLE_LIVE
+                                )
+                            } else {
+                                existing.copy(
+                                    freeRpm = hdrRpm ?: existing.freeRpm,
+                                    freeTpm = hdrTpm ?: existing.freeTpm,
+                                    source = GeminiRateLimitProfile.SOURCE_GOOGLE_LIVE
+                                )
+                            }
+                            baselineById[keyLower] = updated
+                        }
+
+                        val isPaidOnlyIndicator = !PreferencesRepo.isModelFreeTierEligible(probeModel)
+                        when {
+                            resp.isSuccessful && isPaidOnlyIndicator -> {
+                                detectedTier = GeminiRateLimitSnapshot.TIER_PAID_1
+                            }
+                            resp.code == 429 -> {
+                                val reportedLimit = Regex("""(?:limit:\s*|quotaValue["':\s]+)(\d+)""", RegexOption.IGNORE_CASE)
+                                    .find(bodyStr)?.groupValues?.getOrNull(1)?.toLongOrNull()
+                                if (reportedLimit == 0L && isPaidOnlyIndicator) {
+                                    // Confirmed Free Tier (Paid model limit: 0)
+                                    baselineById[keyLower] = existing.copy(
+                                        freeRpm = 0,
+                                        freeTpm = 0L,
+                                        freeRpd = 0,
+                                        source = GeminiRateLimitProfile.SOURCE_GOOGLE_LIVE
+                                    )
+                                } else if (reportedLimit != null && reportedLimit > 0L) {
+                                    val isTpm = bodyLower.contains("token") || bodyLower.contains("tpm")
+                                    val isRpm = bodyLower.contains("minute") && !isTpm
+                                    baselineById[keyLower] = when {
+                                        isTpm -> existing.copy(
+                                            freeTpm = if (detectedTier == GeminiRateLimitSnapshot.TIER_FREE) reportedLimit else existing.freeTpm,
+                                            paidTpm = if (detectedTier == GeminiRateLimitSnapshot.TIER_PAID_1) reportedLimit else existing.paidTpm,
+                                            source = GeminiRateLimitProfile.SOURCE_GOOGLE_LIVE
+                                        )
+                                        isRpm -> existing.copy(
+                                            freeRpm = if (detectedTier == GeminiRateLimitSnapshot.TIER_FREE) reportedLimit.toInt() else existing.freeRpm,
+                                            paidRpm = if (detectedTier == GeminiRateLimitSnapshot.TIER_PAID_1) reportedLimit.toInt() else existing.paidRpm,
+                                            source = GeminiRateLimitProfile.SOURCE_GOOGLE_LIVE
+                                        )
+                                        else -> existing
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        val tierText = if (detectedTier == GeminiRateLimitSnapshot.TIER_PAID_1) "Paid Tier 1+" else "Free Tier"
+        if (headersDetected) notes.add("Live rate-limit headers applied")
+        notes.add("Account tier: $tierText")
+
+        GeminiRateLimitSnapshot(
+            referenceDate = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(now)),
+            source = GeminiRateLimitProfile.SOURCE_GOOGLE_LIVE,
+            detectedTier = detectedTier,
+            checkedAtMs = now,
+            statusSummary = notes.joinToString(" • ").ifBlank { "Live Google check complete ($tierText)" },
+            profiles = baselineById.values.sortedBy { p ->
+                val idx = PreferencesRepo.SUPPORTED_MODELS.indexOf(p.modelId)
+                if (idx >= 0) idx else 100
+            }
+        )
+    }
+
+    /**
+     * Best-effort parser for Google's official `ai.google.dev/gemini-api/docs/rate-limits` HTML tables.
+     * Extracts `(RPM, TPM, RPD)` triples for any `gemini-*` model rows found.
+     */
+    private fun parseGoogleRateLimitDocsHtml(html: String): Map<String, Triple<Int?, Long?, Int?>> {
+        if (html.isBlank()) return emptyMap()
+        val parsed = LinkedHashMap<String, Triple<Int?, Long?, Int?>>()
+        val rowRegex = Regex("""<tr\b[^>]*>(.*?)</tr>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        val cellRegex = Regex("""<t[dh]\b[^>]*>(.*?)</t[dh]>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        val tagStripRegex = Regex("""<[^>]+>""")
+        val modelIdRegex = Regex("""gemini-[a-z0-9._-]{2,40}""", RegexOption.IGNORE_CASE)
+
+        fun parseCompactNumber(raw: String): Long? {
+            val cleaned = raw.replace(",", "").replace(" ", "").trim().lowercase()
+            val m = Regex("""^(\d+(?:\.\d+)?)(k|m)?$""").find(cleaned) ?: return null
+            val num = m.groupValues[1].toDoubleOrNull() ?: return null
+            return when (m.groupValues[2]) {
+                "k" -> (num * 1_000.0).toLong()
+                "m" -> (num * 1_000_000.0).toLong()
+                else -> num.toLong()
+            }
+        }
+
+        for (rowMatch in rowRegex.findAll(html)) {
+            val cells = cellRegex.findAll(rowMatch.groupValues[1])
+                .map { tagStripRegex.replace(it.groupValues[1], " ").replace("&nbsp;", " ").trim() }
+                .toList()
+            if (cells.size < 3) continue
+
+            val modelMatch = modelIdRegex.find(cells[0]) ?: continue
+            val modelId = modelMatch.value.lowercase()
+            if (!isEligibleMultimodalModelName(modelId)) continue
+            if (modelId in parsed) continue // Keep the first (Free Tier) table row
+
+            val numericCells = cells.drop(1).mapNotNull { parseCompactNumber(it) }
+            if (numericCells.size >= 2) {
+                val rpm = numericCells.getOrNull(0)?.toInt()?.takeIf { it in 1..10_000 }
+                val tpm = numericCells.getOrNull(1)?.takeIf { it >= 10_000L }
+                val rpd = numericCells.getOrNull(2)?.toInt()?.takeIf { it in 1..1_000_000 }
+                if (rpm != null || tpm != null) {
+                    parsed[modelId] = Triple(rpm, tpm, rpd)
+                }
+            }
+        }
+        return parsed
     }
 
     private fun extractOutputTextFromInteraction(root: JsonObject): String? {

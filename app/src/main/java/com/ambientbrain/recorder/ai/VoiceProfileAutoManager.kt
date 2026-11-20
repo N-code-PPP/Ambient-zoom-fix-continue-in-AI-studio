@@ -3531,10 +3531,18 @@ object VoiceProfileAutoManager {
         auditPromptText: String,
         audioClips: List<VoiceProfileAuditAudioClip>
     ): Pair<GeminiVoiceProfileAuditCallResponse, String> {
+        if (prefs.isGeminiUsagePausedNow()) {
+            throw IllegalStateException("Gemini AI is currently paused. Resume Gemini in Settings or the top bar to run Voice Profile Audit.")
+        }
         val orderedPool = prefs.getAllApiKeys()
         if (orderedPool.isEmpty()) {
             throw IllegalStateException("No Gemini API key configured in Settings.")
         }
+        val estTokens = GeminiRateLimitManager.estimateInputTokens(
+            systemInstruction = systemInstruction,
+            promptText = auditPromptText,
+            audioFiles = audioClips.map { it.file }
+        )
         val primaryModel = prefs.geminiModel
         val fallbackModel = prefs.fallbackGeminiModel
         val hasFallback = fallbackModel != PreferencesRepo.FALLBACK_MODEL_NONE &&
@@ -3543,14 +3551,34 @@ object VoiceProfileAutoManager {
 
         var lastErr: Exception? = null
         for ((modelIdx, activeModel) in modelsToTry.withIndex()) {
-            val keysToTry = prefs.getPrioritizedApiKeysForModel(activeModel)
+            val hasNextFallback = modelIdx == 0 && hasFallback
+            val strategy = GeminiRateLimitManager.planRequestStrategy(
+                prefs = prefs,
+                model = activeModel,
+                estimatedInputTokens = estTokens,
+                hasFallbackModel = hasNextFallback
+            )
+            if (hasNextFallback && strategy.recommendProactiveFallback) {
+                continue
+            }
+
+            val keysToTry = strategy.orderedKeys
             val strictModel = modelIdx == 0 && hasFallback
             var sawQuotaBillingOrUnavailable = false
             var sawNetworkOffline = false
 
             for ((attemptIdx, keyCandidate) in keysToTry.withIndex()) {
+                if (prefs.isGeminiUsagePausedNow()) {
+                    throw IllegalStateException("Gemini AI was paused during Voice Profile Audit.")
+                }
                 val slot = orderedPool.indexOf(keyCandidate).let { if (it >= 0) it + 1 else attemptIdx + 1 }
                 try {
+                    GeminiRateLimitManager.acquireSlotBeforeCall(
+                        prefs = prefs,
+                        apiKey = keyCandidate,
+                        model = activeModel,
+                        estimatedInputTokens = estTokens
+                    )
                     val resp = client.auditAndCreateVoiceProfiles(
                         apiKey = keyCandidate,
                         model = activeModel,
@@ -3561,6 +3589,12 @@ object VoiceProfileAutoManager {
                     )
                     val resolvedModel = resp.actualModel.ifBlank { activeModel }
                     prefs.recordApiKeySuccess(keyCandidate, resolvedModel)
+                    GeminiRateLimitManager.recordActualTokensCompleted(
+                        prefs = prefs,
+                        apiKey = keyCandidate,
+                        model = resolvedModel,
+                        actualInputTokens = resp.inputTokens
+                    )
                     val fallbackTag = if (modelIdx > 0) " (fallback)" else ""
                     return resp to "$resolvedModel$fallbackTag:key-pool#$slot"
                 } catch (e: kotlinx.coroutines.CancellationException) {
@@ -3568,11 +3602,20 @@ object VoiceProfileAutoManager {
                 } catch (e: Exception) {
                     lastErr = e
                     val cls = GeminiInteractionsClient.classifyApiFailure(e)
+                    val retryAfterMs = if (cls.isQuotaOrBilling) {
+                        GeminiRateLimitManager.learnFrom429Response(
+                            prefs = prefs,
+                            apiKey = keyCandidate,
+                            model = activeModel,
+                            errorMessage = e.message.orEmpty()
+                        )
+                    } else null
                     prefs.recordApiKeyFailure(
                         key = keyCandidate,
                         model = activeModel,
                         failureCategory = cls.category,
-                        errorMsg = e.message ?: cls.category
+                        errorMsg = e.message ?: cls.category,
+                        retryAfterMs = retryAfterMs
                     )
                     if (cls.isQuotaOrBilling || cls.isModelUnavailable) {
                         sawQuotaBillingOrUnavailable = true

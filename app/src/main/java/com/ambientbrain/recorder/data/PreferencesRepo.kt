@@ -203,6 +203,59 @@ data class ModelAllowanceEntry(
 }
 
 @Serializable
+data class GeminiRateLimitProfile(
+    val modelId: String,
+    val freeRpm: Int = 10,
+    val freeTpm: Long = 250_000L,
+    val freeRpd: Int = 250,
+    val paidRpm: Int = 1_000,
+    val paidTpm: Long = 1_000_000L,
+    val paidRpd: Int = 10_000,
+    val inputTokenLimit: Long = 1_048_576L,
+    val source: String = SOURCE_DEFAULT_NOV_2026
+) {
+    companion object {
+        const val SOURCE_DEFAULT_NOV_2026 = "DEFAULT_NOV_20_2026"
+        const val SOURCE_GOOGLE_LIVE = "GOOGLE_LIVE"
+        const val SOURCE_ADAPTED_429 = "ADAPTED_429"
+    }
+}
+
+@Serializable
+data class GeminiRateLimitSnapshot(
+    val referenceDate: String = "2026-11-20",
+    val source: String = GeminiRateLimitProfile.SOURCE_DEFAULT_NOV_2026,
+    val detectedTier: String = TIER_FREE,
+    val checkedAtMs: Long = 0L,
+    val statusSummary: String = "",
+    val profiles: List<GeminiRateLimitProfile> = emptyList()
+) {
+    companion object {
+        const val TIER_FREE = "FREE"
+        const val TIER_PAID_1 = "PAID_TIER_1"
+    }
+}
+
+data class GeminiPauseState(
+    val isPaused: Boolean = false,
+    val pausedUntilMs: Long = 0L // 0L = paused indefinitely until user resumes
+) {
+    fun isActivelyPaused(nowMs: Long = System.currentTimeMillis()): Boolean {
+        if (!isPaused) return false
+        return pausedUntilMs <= 0L || nowMs < pausedUntilMs
+    }
+}
+
+object GeminiPauseStateBus {
+    private val _state = MutableStateFlow(GeminiPauseState())
+    val state: StateFlow<GeminiPauseState> = _state.asStateFlow()
+
+    fun publish(isPaused: Boolean, pausedUntilMs: Long) {
+        _state.value = GeminiPauseState(isPaused = isPaused, pausedUntilMs = pausedUntilMs)
+    }
+}
+
+@Serializable
 data class GlossaryTermEntry(
     val id: String = UUID.randomUUID().toString().take(8),
     val term: String,
@@ -1332,7 +1385,8 @@ class PreferencesRepo(private val context: Context) {
         key: String,
         model: String,
         failureCategory: String,
-        errorMsg: String
+        errorMsg: String,
+        retryAfterMs: Long? = null
     ) {
         val trimmed = key.trim()
         if (trimmed.isBlank()) return
@@ -1392,14 +1446,14 @@ class PreferencesRepo(private val context: Context) {
                     updatedModelCooldowns[normalizedModel] = now + 30L * 60_000L
                 }
                 isRateLimit -> {
-                    // Per-model progressive backoff (2m -> 5m -> 10m) so fallback model can run immediately
+                    // Honor Google's explicit retryDelay when provided, else progressive backoff (2m -> 5m -> 10m)
                     newStatus = ApiKeyHealth.STATUS_RATE_LIMITED
-                    val backoffMin = when {
-                        failures <= 1 -> 2L
-                        failures == 2 -> 5L
-                        else -> 10L
+                    val backoffMs = retryAfterMs?.coerceIn(15_000L, 15L * 60_000L) ?: when {
+                        failures <= 1 -> 2L * 60_000L
+                        failures == 2 -> 5L * 60_000L
+                        else -> 10L * 60_000L
                     }
-                    updatedModelCooldowns[normalizedModel] = now + backoffMin * 60_000L
+                    updatedModelCooldowns[normalizedModel] = now + backoffMs
                 }
                 isModelUnavailable -> {
                     newStatus = prev.status.ifBlank { ApiKeyHealth.STATUS_UNTESTED }
@@ -1486,6 +1540,91 @@ class PreferencesRepo(private val context: Context) {
 
     fun saveCachedModelAllowance(entries: List<ModelAllowanceEntry>) {
         prefs.edit().putString(KEY_MODEL_ALLOWANCE_CACHE, json.encodeToString(entries)).apply()
+    }
+
+    // ---- Gemini Temporary Pause Controls ----
+
+    var isGeminiPaused: Boolean
+        get() = prefs.getBoolean(KEY_GEMINI_PAUSED, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_GEMINI_PAUSED, value).apply()
+            if (!value) {
+                prefs.edit().putLong(KEY_GEMINI_PAUSED_UNTIL_MS, 0L).apply()
+                GeminiPauseStateBus.publish(false, 0L)
+            } else {
+                GeminiPauseStateBus.publish(true, geminiPausedUntilMs)
+            }
+        }
+
+    var geminiPausedUntilMs: Long
+        get() = prefs.getLong(KEY_GEMINI_PAUSED_UNTIL_MS, 0L)
+        set(value) {
+            prefs.edit().putLong(KEY_GEMINI_PAUSED_UNTIL_MS, value.coerceAtLeast(0L)).apply()
+            GeminiPauseStateBus.publish(isGeminiPaused, value.coerceAtLeast(0L))
+        }
+
+    fun setGeminiPaused(paused: Boolean, durationMs: Long = 0L) {
+        val until = if (paused && durationMs > 0L) System.currentTimeMillis() + durationMs else 0L
+        prefs.edit()
+            .putBoolean(KEY_GEMINI_PAUSED, paused)
+            .putLong(KEY_GEMINI_PAUSED_UNTIL_MS, until)
+            .apply()
+        GeminiPauseStateBus.publish(paused, until)
+    }
+
+    /**
+     * Checks whether Gemini API calls are currently paused, auto-expiring timed pauses cleanly.
+     */
+    fun isGeminiUsagePausedNow(nowMs: Long = System.currentTimeMillis()): Boolean {
+        val paused = prefs.getBoolean(KEY_GEMINI_PAUSED, false)
+        if (!paused) {
+            if (GeminiPauseStateBus.state.value.isPaused) {
+                GeminiPauseStateBus.publish(false, 0L)
+            }
+            return false
+        }
+        val until = prefs.getLong(KEY_GEMINI_PAUSED_UNTIL_MS, 0L)
+        if (until > 0L && nowMs >= until) {
+            setGeminiPaused(false, 0L)
+            return false
+        }
+        if (!GeminiPauseStateBus.state.value.isPaused || GeminiPauseStateBus.state.value.pausedUntilMs != until) {
+            GeminiPauseStateBus.publish(true, until)
+        }
+        return true
+    }
+
+    fun syncGeminiPauseStateBus() {
+        isGeminiUsagePausedNow()
+    }
+
+    // ---- Rate Limit Reference & Adaptive Strategy Persistence ----
+
+    /**
+     * When true (default), uses the built-in Nov 20, 2026 reference rate limit table and
+     * default conservative Gemini API strategy. Turning this OFF enables Live Google rate-limit
+     * adaptation (live checks + real-time 429 quota calibration).
+     */
+    var useDefaultRateLimitReference: Boolean
+        get() = prefs.getBoolean(KEY_USE_DEFAULT_RATE_LIMIT_REF, true)
+        set(value) {
+            prefs.edit().putBoolean(KEY_USE_DEFAULT_RATE_LIMIT_REF, value).apply()
+        }
+
+    fun getLiveRateLimitSnapshot(): GeminiRateLimitSnapshot? {
+        val raw = prefs.getString(KEY_LIVE_RATE_LIMIT_SNAPSHOT_JSON, null)
+        if (raw.isNullOrBlank()) return null
+        return runCatching {
+            json.decodeFromString<GeminiRateLimitSnapshot>(raw)
+        }.getOrNull()
+    }
+
+    fun saveLiveRateLimitSnapshot(snapshot: GeminiRateLimitSnapshot) {
+        prefs.edit().putString(KEY_LIVE_RATE_LIMIT_SNAPSHOT_JSON, json.encodeToString(snapshot)).apply()
+    }
+
+    fun clearLiveRateLimitSnapshot() {
+        prefs.edit().remove(KEY_LIVE_RATE_LIMIT_SNAPSHOT_JSON).apply()
     }
 
     fun exportSettingsPayload(includeApiKeys: Boolean = false): SettingsBackupPayload {
@@ -1976,6 +2115,10 @@ class PreferencesRepo(private val context: Context) {
         private const val KEY_MEETING_VIDEO_CUSTOM_TREE_URI = "meeting_video_custom_tree_uri"
         private const val KEY_MEETING_VIDEO_CUSTOM_FOLDER_LABEL = "meeting_video_custom_folder_label"
         private const val KEY_PENDING_APPOPS_MIC_RESTORE_PKG = "pending_appops_mic_restore_pkg"
+        private const val KEY_GEMINI_PAUSED = "gemini_usage_paused"
+        private const val KEY_GEMINI_PAUSED_UNTIL_MS = "gemini_usage_paused_until_ms"
+        private const val KEY_USE_DEFAULT_RATE_LIMIT_REF = "use_default_rate_limit_reference"
+        private const val KEY_LIVE_RATE_LIMIT_SNAPSHOT_JSON = "live_rate_limit_snapshot_json"
 
         const val DEFAULT_MEETING_VIDEO_FOLDER = "Download/AmbientBrain"
 

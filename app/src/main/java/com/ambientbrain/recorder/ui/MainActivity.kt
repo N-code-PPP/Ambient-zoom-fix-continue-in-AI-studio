@@ -44,7 +44,9 @@ import androidx.compose.material.icons.filled.MedicalServices
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PauseCircle
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Restore
@@ -77,6 +79,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -86,14 +89,18 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.ambientbrain.recorder.ai.GeminiRateLimitManager
 import com.ambientbrain.recorder.ai.SessionAnalyzeWorker
 import com.ambientbrain.recorder.data.AppDatabase
 import com.ambientbrain.recorder.data.AudioPurgeWorker
 import com.ambientbrain.recorder.data.CaptureStateBus
 import com.ambientbrain.recorder.data.ExportPreset
+import com.ambientbrain.recorder.data.GeminiPauseState
+import com.ambientbrain.recorder.data.GeminiPauseStateBus
 import com.ambientbrain.recorder.data.LiveCaptureStatus
 import com.ambientbrain.recorder.data.LiveCaptureTelemetry
 import com.ambientbrain.recorder.data.PreferencesRepo
@@ -384,10 +391,33 @@ private fun AmbientBrainMainApp(
 
     val telemetry by CaptureStateBus.telemetry.collectAsStateWithLifecycle()
     val meetingState by MeetingRecorderStateBus.state.collectAsStateWithLifecycle()
+    val geminiPauseState by GeminiPauseStateBus.state.collectAsStateWithLifecycle()
     val activeItems by dao.observeAllActiveItems().collectAsState(initial = emptyList())
     val roundSessions by dao.observeRoundSessions().collectAsState(initial = emptyList())
     val allSessions by dao.observeAllSessionsWithDetails().collectAsState(initial = emptyList())
     val failedSessions by dao.observeFailedSessions().collectAsState(initial = emptyList())
+    val queuedSessionsCount by dao.observeQueuedSessionsCount().collectAsState(initial = 0)
+    var pauseClockMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+
+    LaunchedEffect(Unit) {
+        prefs.syncGeminiPauseStateBus()
+        GeminiRateLimitManager.refreshTelemetry(prefs)
+    }
+
+    LaunchedEffect(geminiPauseState.isPaused, geminiPauseState.pausedUntilMs) {
+        while (geminiPauseState.isPaused) {
+            val now = System.currentTimeMillis()
+            pauseClockMs = now
+            if (geminiPauseState.pausedUntilMs > 0L && now >= geminiPauseState.pausedUntilMs) {
+                prefs.isGeminiUsagePausedNow(now)
+                SessionAnalyzeWorker.resumeAllQueuedAfterUnpause(context)
+                break
+            }
+            delay(1_000L)
+        }
+    }
+
+    val isGeminiActivelyPaused = geminiPauseState.isActivelyPaused(pauseClockMs)
 
     val audioFilesCount = remember(allSessions, activeItems) {
         val sessionRawCount = allSessions.count {
@@ -615,6 +645,29 @@ private fun AmbientBrainMainApp(
                     Toast.makeText(context, "Storage clean-up worker triggered!", Toast.LENGTH_SHORT).show()
                 },
                 failedSessionsCount = failedSessions.size,
+                isGeminiPaused = isGeminiActivelyPaused,
+                onToggleGeminiPause = {
+                    if (isGeminiActivelyPaused) {
+                        prefs.setGeminiPaused(paused = false, durationMs = 0L)
+                        SessionAnalyzeWorker.resumeAllQueuedAfterUnpause(context)
+                        Toast.makeText(
+                            context,
+                            if (queuedSessionsCount > 0) {
+                                "Gemini AI resumed — analyzing $queuedSessionsCount queued session(s)..."
+                            } else {
+                                "Gemini AI resumed."
+                            },
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    } else {
+                        prefs.setGeminiPaused(paused = true, durationMs = 0L)
+                        Toast.makeText(
+                            context,
+                            "Gemini AI paused. Audio continues recording & queueing safely.",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                },
                 onRetryAllFailed = {
                     SessionAnalyzeWorker.retryAllFailed(context)
                     Toast.makeText(context, "Retrying Gemini connection for all pending sessions...", Toast.LENGTH_SHORT).show()
@@ -715,6 +768,27 @@ private fun AmbientBrainMainApp(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
+            if (isGeminiActivelyPaused) {
+                GeminiPausedBanner(
+                    pauseState = geminiPauseState,
+                    nowMs = pauseClockMs,
+                    queuedSessionsCount = queuedSessionsCount,
+                    onResumeGemini = {
+                        prefs.setGeminiPaused(paused = false, durationMs = 0L)
+                        SessionAnalyzeWorker.resumeAllQueuedAfterUnpause(context)
+                        Toast.makeText(
+                            context,
+                            if (queuedSessionsCount > 0) {
+                                "Gemini AI resumed — dispatching $queuedSessionsCount queued session(s)..."
+                            } else {
+                                "Gemini AI resumed."
+                            },
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                )
+            }
+
             if (failedSessions.isNotEmpty()) {
                 FailedSessionsBanner(
                     failedSessions = failedSessions,
@@ -989,12 +1063,91 @@ private fun FailedSessionsBanner(
 }
 
 @Composable
+private fun GeminiPausedBanner(
+    pauseState: GeminiPauseState,
+    nowMs: Long,
+    queuedSessionsCount: Int,
+    onResumeGemini: () -> Unit
+) {
+    val amber = Color(0xFFF59E0B)
+    val remainingText = if (pauseState.pausedUntilMs > nowMs) {
+        val totalSec = ((pauseState.pausedUntilMs - nowMs) / 1000L).coerceAtLeast(1L)
+        val hrs = totalSec / 3600L
+        val mins = (totalSec % 3600L) / 60L
+        val secs = totalSec % 60L
+        when {
+            hrs > 0L -> "Auto-resumes in ${hrs}h ${mins}m"
+            mins > 0L -> "Auto-resumes in ${mins}m ${secs}s"
+            else -> "Auto-resumes in ${secs}s"
+        }
+    } else {
+        "Paused until you resume"
+    }
+    Card(
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = amber.copy(alpha = 0.16f)
+        ),
+        border = BorderStroke(1.dp, amber.copy(alpha = 0.6f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 6.dp)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.PauseCircle,
+                contentDescription = "Gemini AI Paused",
+                tint = amber,
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Gemini AI Temporarily Paused",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = amber
+                )
+                Text(
+                    text = "$remainingText • $queuedSessionsCount queued • Audio capture stays active",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
+                    maxLines = 2
+                )
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Button(
+                onClick = onResumeGemini,
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = amber,
+                    contentColor = Color(0xFF1F1300)
+                ),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                modifier = Modifier
+                    .height(34.dp)
+                    .testTag("resume_gemini_banner_button")
+            ) {
+                Icon(Icons.Default.PlayCircle, contentDescription = null, modifier = Modifier.size(14.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Resume", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+@Composable
 private fun PersistentTopStatusBar(
     telemetry: LiveCaptureTelemetry,
     meetingState: MeetingRecorderState = MeetingRecorderState(),
     retentionDays: Int,
     isListening: Boolean,
     failedSessionsCount: Int = 0,
+    isGeminiPaused: Boolean = false,
+    onToggleGeminiPause: () -> Unit = {},
     onOpenMeetingRecorder: () -> Unit = {},
     onStopMeetingRecording: () -> Unit = {},
     onRetryAllFailed: () -> Unit = {},
@@ -1460,6 +1613,38 @@ private fun PersistentTopStatusBar(
                                     tint = if (isListening) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
                                 )
                             }
+                        )
+                        DropdownMenuItem(
+                            text = {
+                                Column {
+                                    Text(
+                                        text = if (isGeminiPaused) "▶️ Resume Gemini AI Calls" else "⏸️ Pause Gemini AI Calls",
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (isGeminiPaused) Color(0xFF10B981) else Color(0xFFF59E0B)
+                                    )
+                                    Text(
+                                        text = if (isGeminiPaused) {
+                                            "Resume cloud analysis & dispatch queued sessions"
+                                        } else {
+                                            "Pause API calls temporarily; keep recording locally"
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            },
+                            onClick = {
+                                menuExpanded = false
+                                onToggleGeminiPause()
+                            },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = if (isGeminiPaused) Icons.Default.PlayCircle else Icons.Default.PauseCircle,
+                                    contentDescription = if (isGeminiPaused) "Resume Gemini AI" else "Pause Gemini AI",
+                                    tint = if (isGeminiPaused) Color(0xFF10B981) else Color(0xFFF59E0B)
+                                )
+                            },
+                            modifier = Modifier.testTag("menu_toggle_gemini_pause")
                         )
                         DropdownMenuItem(
                             text = { Text("🚪 Stop Listening & Exit App", fontWeight = FontWeight.SemiBold) },
