@@ -14,6 +14,7 @@ import android.media.projection.MediaProjection
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
+import android.os.SystemClock
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.Settings
@@ -179,7 +180,11 @@ class MediaProjectionVideoRecorder(
     val outputVideoFile: File,
     private val targetShortEdgePx: Int = 720,
     private val fps: Int = 15,
-    private val bitrateBps: Int = 2_000_000
+    private val bitrateBps: Int = 2_000_000,
+    private val mediaTimelineAnchorMonoMs: AtomicLong = AtomicLong(0L),
+    private val accumulatedPausedMs: AtomicLong = AtomicLong(0L),
+    private val pausedAtAnchorMs: AtomicLong = AtomicLong(0L),
+    private val usesExternalPauseClock: Boolean = false
 ) {
     private var codec: MediaCodec? = null
     private var inputSurface: Surface? = null
@@ -189,6 +194,7 @@ class MediaProjectionVideoRecorder(
 
     private val isRunning = AtomicBoolean(false)
     private val isPaused = AtomicBoolean(false)
+    private val localPauseStartMonoMs = AtomicLong(-1L)
     private val awaitingSyncFrameAfterResume = AtomicBoolean(false)
     private val muxerStarted = AtomicBoolean(false)
     private val framesWritten = AtomicLong(0L)
@@ -248,6 +254,16 @@ class MediaProjectionVideoRecorder(
 
     fun setPaused(paused: Boolean) {
         val prev = isPaused.getAndSet(paused)
+        if (!usesExternalPauseClock) {
+            if (!prev && paused) {
+                localPauseStartMonoMs.set(SystemClock.elapsedRealtime())
+            } else if (prev && !paused) {
+                val startedAt = localPauseStartMonoMs.getAndSet(-1L)
+                if (startedAt > 0L) {
+                    accumulatedPausedMs.addAndGet((SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L))
+                }
+            }
+        }
         if (prev && !paused) {
             awaitingSyncFrameAfterResume.set(true)
             runCatching {
@@ -297,8 +313,7 @@ class MediaProjectionVideoRecorder(
         val bufferInfo = MediaCodec.BufferInfo()
         var videoTrackIndex = -1
         var firstInputPtsUs = -1L
-        var pausedAccumulatedUs = 0L
-        var pauseStartPtsUs = -1L
+        var videoInitialOffsetUs = 0L
         var lastWrittenPtsUs = -1L
         var eosWaitTicks = 0
 
@@ -328,26 +343,28 @@ class MediaProjectionVideoRecorder(
                 if (!isConfig && bufferInfo.size > 0 && encodedData != null && muxerStarted.get() && videoTrackIndex >= 0) {
                     val rawPtsUs = bufferInfo.presentationTimeUs
                     if (firstInputPtsUs < 0L) {
+                        val nowMonoMs = SystemClock.elapsedRealtime()
                         firstInputPtsUs = rawPtsUs
+                        if (mediaTimelineAnchorMonoMs.compareAndSet(0L, nowMonoMs)) {
+                            pausedAtAnchorMs.set(accumulatedPausedMs.get())
+                            videoInitialOffsetUs = 0L
+                        } else {
+                            val anchorMono = mediaTimelineAnchorMonoMs.get()
+                            val pausedSinceAnchorMs = (accumulatedPausedMs.get() - pausedAtAnchorMs.get()).coerceAtLeast(0L)
+                            videoInitialOffsetUs = ((nowMonoMs - anchorMono - pausedSinceAnchorMs).coerceAtLeast(0L)) * 1_000L
+                        }
                     }
 
                     if (isPaused.get()) {
-                        if (pauseStartPtsUs < 0L) {
-                            pauseStartPtsUs = rawPtsUs
-                        }
+                        // Drop frames during active pause; shared accumulatedPausedMs tracks exact pause duration
                     } else if (awaitingSyncFrameAfterResume.get() && !isKeyFrame) {
-                        if (pauseStartPtsUs < 0L) {
-                            pauseStartPtsUs = rawPtsUs
-                        }
+                        // Drop P-frames until clean IDR keyframe arrives
                     } else {
                         if (awaitingSyncFrameAfterResume.get() && isKeyFrame) {
                             awaitingSyncFrameAfterResume.set(false)
                         }
-                        if (pauseStartPtsUs >= 0L) {
-                            pausedAccumulatedUs += (rawPtsUs - pauseStartPtsUs).coerceAtLeast(0L)
-                            pauseStartPtsUs = -1L
-                        }
-                        var adjustedPtsUs = (rawPtsUs - firstInputPtsUs - pausedAccumulatedUs).coerceAtLeast(0L)
+                        val sharedPausedUs = ((accumulatedPausedMs.get() - pausedAtAnchorMs.get()).coerceAtLeast(0L)) * 1_000L
+                        var adjustedPtsUs = (videoInitialOffsetUs + (rawPtsUs - firstInputPtsUs) - sharedPausedUs).coerceAtLeast(0L)
                         if (lastWrittenPtsUs >= 0L && adjustedPtsUs <= lastWrittenPtsUs) {
                             adjustedPtsUs = lastWrittenPtsUs + 1_000L
                         }
@@ -377,18 +394,28 @@ class MediaProjectionVideoRecorder(
     companion object {
         private const val TAG = "MediaProjVideoRec"
 
-        fun computeRecordingDimensions(context: Context, targetShortEdgePx: Int = 720): Triple<Int, Int, Int> {
+        fun computeRecordingDimensions(
+            context: Context,
+            targetShortEdgePx: Int = 720,
+            landscape: Boolean = false
+        ): Triple<Int, Int, Int> {
+            val rawDpi = context.resources.displayMetrics.densityDpi.coerceIn(160, 480)
+            if (landscape) {
+                val shortEdge = ((targetShortEdgePx + 8) / 16) * 16
+                val longEdge = (((shortEdge * 16f / 9f).toInt() + 8) / 16) * 16
+                // Slightly lower DPI on 16:9 landscape virtual displays keeps Zoom/Webex slides & toolbars uncrowded
+                return Triple(longEdge.coerceIn(640, 1280), shortEdge.coerceIn(360, 720), minOf(rawDpi, 260))
+            }
             val wm = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
             val bounds = wm?.currentWindowMetrics?.bounds
             val rawW = bounds?.width()?.takeIf { it > 0 } ?: 1080
             val rawH = bounds?.height()?.takeIf { it > 0 } ?: 2400
-            val dpi = context.resources.displayMetrics.densityDpi.coerceIn(160, 480)
 
             val shortEdge = minOf(rawW, rawH).toFloat()
             val scale = (targetShortEdgePx.toFloat() / shortEdge).coerceAtMost(1.0f)
             val scaledW = (((rawW * scale).toInt() + 8) / 16) * 16
             val scaledH = (((rawH * scale).toInt() + 8) / 16) * 16
-            return Triple(scaledW.coerceIn(320, 1280), scaledH.coerceIn(320, 1600), dpi)
+            return Triple(scaledW.coerceIn(320, 1280), scaledH.coerceIn(320, 1600), rawDpi)
         }
     }
 }
@@ -405,7 +432,8 @@ data class AdbVirtualScreenSession(
     val virtualMicTier: String,
     val audioSessionId: Int = 0,
     val stdinWriter: OutputStreamWriter,
-    val stopLatch: CountDownLatch
+    val stopLatch: CountDownLatch,
+    val stopRequested: AtomicBoolean = AtomicBoolean(false)
 )
 
 data class AdbVirtualScreenStartResult(
@@ -456,7 +484,10 @@ object AdbVirtualScreenController {
         bitrateBps: Int = 2_000_000,
         fps: Int = 15,
         onAudioLevel: (Float, Boolean) -> Unit = { _, _ -> },
-        onPreviewFrame: () -> Unit = {}
+        onPreviewFrame: () -> Unit = {},
+        onAudioSessionUpdated: (String, Int) -> Unit = { _, _ -> },
+        onAudioRebound: (Boolean, String) -> Unit = { _, _ -> },
+        onProcessExited: (Int, String?) -> Unit = { _, _ -> }
     ): AdbVirtualScreenStartResult {
         if (ShizukuAdbManager.getShizukuStatus(context) != ShizukuStatus.AUTHORIZED) {
             return AdbVirtualScreenStartResult(
@@ -495,11 +526,15 @@ object AdbVirtualScreenController {
 
         val readyLatch = CountDownLatch(1)
         val stopLatch = CountDownLatch(1)
+        val readyCompleted = AtomicBoolean(false)
+        val sawCleanStop = AtomicBoolean(false)
+        val stopRequested = AtomicBoolean(false)
         val readyDisplayId = AtomicInteger(-1)
         val audioSessionIdRef = AtomicInteger(0)
         val audioTierRef = AtomicReference("DISABLED")
         val virtualMicTierRef = AtomicReference("DISABLED")
         val errorMessage = AtomicReference<String?>(null)
+        val stderrBuffer = StringBuilder()
 
         Thread({
             try {
@@ -517,11 +552,24 @@ object AdbVirtualScreenController {
                                 val tier = line.removePrefix("AUDIO_CAPTURE_TIER:").trim()
                                 audioTierRef.set(tier)
                                 Log.i(TAG, "[runner] Audio capture tier: $tier")
+                                if (readyCompleted.get()) {
+                                    runCatching { onAudioSessionUpdated(tier, audioSessionIdRef.get()) }
+                                }
                             }
                             line.startsWith("AUDIO_SESSION_ID:") -> {
                                 val sid = line.removePrefix("AUDIO_SESSION_ID:").trim().toIntOrNull() ?: 0
                                 audioSessionIdRef.set(sid)
                                 Log.i(TAG, "[runner] Audio session ID: $sid")
+                                if (readyCompleted.get()) {
+                                    runCatching { onAudioSessionUpdated(audioTierRef.get(), sid) }
+                                }
+                            }
+                            line.startsWith("AUDIO_REBOUND:") -> {
+                                val payload = line.removePrefix("AUDIO_REBOUND:").trim()
+                                val ok = payload.startsWith("OK")
+                                val detail = payload.substringAfter(":", payload)
+                                Log.i(TAG, "[runner] Audio rebound: ok=$ok detail=$detail")
+                                runCatching { onAudioRebound(ok, detail) }
                             }
                             line.startsWith("VIRTUAL_MIC_TIER:") -> {
                                 val tier = line.removePrefix("VIRTUAL_MIC_TIER:").trim()
@@ -541,6 +589,7 @@ object AdbVirtualScreenController {
                                 runCatching { onPreviewFrame() }
                             }
                             line.startsWith("VIRTUAL_DISPLAY_STOPPED:") -> {
+                                sawCleanStop.set(true)
                                 Log.i(TAG, "[runner] $line")
                                 stopLatch.countDown()
                             }
@@ -553,20 +602,31 @@ object AdbVirtualScreenController {
             } finally {
                 readyLatch.countDown()
                 stopLatch.countDown()
+                if (readyCompleted.get() && !sawCleanStop.get() && !stopRequested.get()) {
+                    val exitCode = runCatching {
+                        process.waitFor(300, TimeUnit.MILLISECONDS)
+                        process.exitValue()
+                    }.getOrDefault(-1)
+                    val errText = errorMessage.get()
+                        ?: synchronized(stderrBuffer) { stderrBuffer.toString().trim().takeIf { it.isNotBlank() } }
+                    Log.w(TAG, "ADB Virtual Display runner exited unexpectedly (code=$exitCode, err=$errText)")
+                    runCatching { onProcessExited(exitCode, errText) }
+                }
             }
         }, "AdbVDisp-Stdout").apply {
             isDaemon = true
             start()
         }
 
-        val stderrBuffer = StringBuilder()
         Thread({
             runCatching {
                 BufferedReader(InputStreamReader(process.errorStream)).use { reader ->
                     while (true) {
                         val line = reader.readLine() ?: break
-                        if (stderrBuffer.length < 1024) {
-                            stderrBuffer.append(line).append('\n')
+                        synchronized(stderrBuffer) {
+                            if (stderrBuffer.length < 1024) {
+                                stderrBuffer.append(line).append('\n')
+                            }
                         }
                         Log.w(TAG, "[runner stderr] $line")
                     }
@@ -582,10 +642,11 @@ object AdbVirtualScreenController {
         if (!signaled || displayId <= 0) {
             runCatching { process.destroyForcibly() }
             val reason = errorMessage.get()
-                ?: stderrBuffer.toString().trim().takeIf { it.isNotBlank() }
+                ?: synchronized(stderrBuffer) { stderrBuffer.toString().trim().takeIf { it.isNotBlank() } }
                 ?: "Timed out creating ADB virtual display on this device ROM."
             return AdbVirtualScreenStartResult(error = reason)
         }
+        readyCompleted.set(true)
 
         val previewFile = tempVideoFile.parentFile?.let { parent ->
             File(parent, "preview_${tempVideoFile.nameWithoutExtension}.jpg").also { existing ->
@@ -605,7 +666,8 @@ object AdbVirtualScreenController {
             virtualMicTier = virtualMicTierRef.get(),
             audioSessionId = audioSessionIdRef.get(),
             stdinWriter = OutputStreamWriter(process.outputStream),
-            stopLatch = stopLatch
+            stopLatch = stopLatch,
+            stopRequested = stopRequested
         )
         Log.i(
             TAG,
@@ -908,6 +970,7 @@ object AdbVirtualScreenController {
     }
 
     fun stopAndFinalize(session: AdbVirtualScreenSession): Pair<Boolean, Boolean> {
+        session.stopRequested.set(true)
         sendCommand(session, "STOP")
         runCatching { session.stdinWriter.close() }
         runCatching { session.stopLatch.await(6, TimeUnit.SECONDS) }
@@ -942,12 +1005,14 @@ object AdbVirtualScreenController {
         if (ShizukuAdbManager.getShizukuStatus(context) != ShizukuStatus.AUTHORIZED) return false
         val safePkg = packageName.replace(Regex("[^A-Za-z0-9._]"), "")
         if (safePkg.isBlank()) return false
+        val uid = InstalledAppQueryHelper.resolveAppUid(context, safePkg)
+        val userId = if (uid > 0) uid / 100_000 else 0
         val mode = if (allow) "allow" else "ignore"
         val (code, out) = ShizukuAdbManager.runShizukuShellCommand(
-            "cmd appops set --user 0 $safePkg RECORD_AUDIO $mode",
+            "cmd appops set --user $userId $safePkg RECORD_AUDIO $mode",
             timeoutSec = 5L
         )
-        Log.i(TAG, "AppOps RECORD_AUDIO $mode for $safePkg -> code=$code ($out)")
+        Log.i(TAG, "AppOps RECORD_AUDIO $mode for $safePkg (user=$userId) -> code=$code ($out)")
         return code == 0
     }
 
@@ -994,23 +1059,34 @@ object AdbVirtualScreenController {
         val safePkg = packageName.replace(Regex("[^A-Za-z0-9._]"), "")
         if (safePkg.isBlank()) return false
 
-        val runningTask = findRunningRootTaskForPackage(safePkg)
-        if (runningTask != null) {
-            val (rootTaskId, currentDisplayId) = runningTask
+        val allTasks = findAllRunningRootTasksForPackage(safePkg)
+        if (allTasks.isNotEmpty()) {
+            // When returning to Display 0, rescue ALL tasks of this package currently on any virtual
+            // display (e.g. both Zoom's active ConfActivity task and its lobby task) so nothing gets
+            // destroyed when the Virtual Display releases.
+            if (displayId == 0) {
+                val virtualTasks = allTasks.filter { it.second > 0 }
+                if (virtualTasks.isEmpty()) {
+                    Log.i(TAG, "$safePkg tasks are already on display 0")
+                    return true
+                }
+                var anyMoved = false
+                for ((rootTaskId, curDisp, _) in virtualTasks) {
+                    if (executeMoveStackCommand(rootTaskId, 0)) {
+                        anyMoved = true
+                    } else {
+                        Log.w(TAG, "Failed returning $safePkg rootTask=$rootTaskId from display $curDisp to 0")
+                    }
+                }
+                return anyMoved
+            }
+
+            val (rootTaskId, currentDisplayId, _) = allTasks.first()
             if (currentDisplayId == displayId) {
                 Log.i(TAG, "$safePkg (rootTask=$rootTaskId) is already on display $displayId")
                 return true
             }
-            val (moveCode, moveOut) = ShizukuAdbManager.runShizukuShellCommand(
-                "am display move-stack $rootTaskId $displayId",
-                timeoutSec = 5L
-            )
-            val moveSucceeded = moveCode == 0 &&
-                !moveOut.contains("Error", ignoreCase = true) &&
-                !moveOut.contains("Exception", ignoreCase = true) &&
-                !moveOut.contains("Unknown", ignoreCase = true)
-            Log.i(TAG, "am display move-stack $rootTaskId -> display $displayId (code=$moveCode, ok=$moveSucceeded): $moveOut")
-            if (moveSucceeded) {
+            if (executeMoveStackCommand(rootTaskId, displayId)) {
                 // Do NOT run am start on the launcher activity — keep the active call activity intact!
                 return true
             }
@@ -1039,6 +1115,33 @@ object AdbVirtualScreenController {
         return startedOk
     }
 
+    private fun executeMoveStackCommand(rootTaskId: Int, displayId: Int): Boolean {
+        val moveCommands = listOf(
+            "am display move-stack $rootTaskId $displayId",
+            "cmd activity display move-stack $rootTaskId $displayId"
+        )
+        for (moveCmd in moveCommands) {
+            val (moveCode, moveOut) = ShizukuAdbManager.runShizukuShellCommand(moveCmd, timeoutSec = 5L)
+            val moveSucceeded = moveCode == 0 &&
+                !moveOut.contains("Error", ignoreCase = true) &&
+                !moveOut.contains("Exception", ignoreCase = true) &&
+                !moveOut.contains("Unknown", ignoreCase = true)
+            Log.i(TAG, "$moveCmd -> code=$moveCode, ok=$moveSucceeded: $moveOut")
+            if (moveSucceeded) return true
+        }
+        return false
+    }
+
+    /**
+     * Returns the displayId where the highest-priority task for [packageName] currently lives,
+     * or null if no running task is found. Used by the virtual-display pin watchdog.
+     */
+    fun getActiveTaskDisplayId(packageName: String): Int? {
+        val safePkg = packageName.replace(Regex("[^A-Za-z0-9._]"), "")
+        if (safePkg.isBlank()) return null
+        return findAllRunningRootTasksForPackage(safePkg).firstOrNull()?.second
+    }
+
     /**
      * Checks which package in [candidates] currently has an active running task in WindowManager.
      * Used to resolve `MeetingPlatform.AUTO` to the actually-running meeting app (e.g. Webex vs Zoom).
@@ -1047,57 +1150,85 @@ object AdbVirtualScreenController {
         if (candidates.isEmpty()) return null
         val (_, dump) = ShizukuAdbManager.runShizukuShellCommand("am stack list 2>/dev/null", timeoutSec = 5L)
         if (dump.isBlank()) return null
+        var bestPkg: String? = null
+        var bestScore = -1
         for (pkg in candidates) {
-            if (parseRootTaskFromStackList(dump, pkg) != null) {
-                return pkg
+            val scored = parseBestRootTaskFromStackList(dump, pkg)
+            if (scored != null && scored.third > bestScore) {
+                bestScore = scored.third
+                bestPkg = pkg
             }
         }
-        return null
+        return bestPkg
     }
 
     /**
-     * Returns `(rootTaskId, currentDisplayId)` for a running task belonging to [packageName].
-     * Correctly tracks the enclosing `RootTask id=<id> ... displayId=<d>` header above child
-     * `taskId=<child>: <packageName>/...` lines so split-screen/freeform/PiP tasks move reliably.
+     * Returns `(rootTaskId, currentDisplayId)` for the highest-priority running task belonging to [packageName].
      */
     fun findRunningRootTaskForPackage(packageName: String): Pair<Int, Int>? {
+        return findAllRunningRootTasksForPackage(packageName).firstOrNull()?.let { it.first to it.second }
+    }
+
+    /**
+     * Returns all running tasks `(rootTaskId, currentDisplayId, score)` belonging to [packageName],
+     * sorted with active Zoom/Webex conference/call activities first.
+     */
+    fun findAllRunningRootTasksForPackage(packageName: String): List<Triple<Int, Int, Int>> {
         val (_, stackDump) = ShizukuAdbManager.runShizukuShellCommand(
             "am stack list 2>/dev/null",
             timeoutSec = 5L
         )
         if (stackDump.isNotBlank()) {
-            val fromStackList = parseRootTaskFromStackList(stackDump, packageName)
-            if (fromStackList != null) return fromStackList
+            val fromStackList = parseAllRootTasksFromStackList(stackDump, packageName)
+            if (fromStackList.isNotEmpty()) return fromStackList
         }
 
         // Fallback for ROMs where `am stack list` is restricted
         val (_, recentsDump) = ShizukuAdbManager.runShizukuShellCommand(
-            "dumpsys activity recents 2>/dev/null | head -n 120",
+            "dumpsys activity recents 2>/dev/null | head -n 140",
             timeoutSec = 5L
         )
-        if (recentsDump.isBlank()) return null
+        if (recentsDump.isBlank()) return emptyList()
 
         val taskIdRegex = Regex("""taskId=(\d+)|#(\d+)\s+type=""")
         val displayIdRegex = Regex("""displayId=(\d+)""")
+        var currentBlockDisplayId = -1
+        val byRootId = LinkedHashMap<Int, Triple<Int, Int, Int>>()
         for (line in recentsDump.lineSequence()) {
+            displayIdRegex.find(line)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { d ->
+                currentBlockDisplayId = d
+            }
             if (!lineMatchesPackage(line, packageName)) continue
             val m = taskIdRegex.find(line) ?: continue
             val id = (m.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() }
                 ?: m.groupValues.getOrNull(2)?.takeIf { it.isNotBlank() })?.toIntOrNull()
             if (id != null && id > 0) {
-                val disp = displayIdRegex.find(line)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: -1
-                return id to disp
+                val disp = displayIdRegex.find(line)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    ?: currentBlockDisplayId
+                val score = scoreMeetingTaskLine(line)
+                val prev = byRootId[id]
+                if (prev == null || score > prev.third) {
+                    byRootId[id] = Triple(id, disp, score)
+                }
             }
         }
-        return null
+        return byRootId.values.sortedByDescending { it.third }
     }
 
     private fun parseRootTaskFromStackList(dump: String, packageName: String): Pair<Int, Int>? {
-        val rootHeaderRegex = Regex("""RootTask\s+id=(\d+).*?displayId=(\d+)""")
+        return parseBestRootTaskFromStackList(dump, packageName)?.let { it.first to it.second }
+    }
+
+    private fun parseBestRootTaskFromStackList(dump: String, packageName: String): Triple<Int, Int, Int>? {
+        return parseAllRootTasksFromStackList(dump, packageName).firstOrNull()
+    }
+
+    private fun parseAllRootTasksFromStackList(dump: String, packageName: String): List<Triple<Int, Int, Int>> {
+        val rootHeaderRegex = Regex("""(?:RootTask|Stack)\s+id=(\d+).*?displayId=(\d+)""")
         val childTaskRegex = Regex("""taskId=(\d+)""")
         var currentRootId = -1
         var currentDisplayId = -1
-        var fallbackMatch: Pair<Int, Int>? = null
+        val byRootId = LinkedHashMap<Int, Triple<Int, Int, Int>>()
 
         for (line in dump.lineSequence()) {
             val rootMatch = rootHeaderRegex.find(line)
@@ -1111,15 +1242,27 @@ object AdbVirtualScreenController {
             val resolvedId = if (currentRootId > 0) currentRootId else (childId ?: -1)
             if (resolvedId <= 0) continue
 
-            val pair = resolvedId to currentDisplayId
-            if (line.contains("visible=true", ignoreCase = true)) {
-                return pair
-            }
-            if (fallbackMatch == null) {
-                fallbackMatch = pair
+            val score = scoreMeetingTaskLine(line)
+            val prev = byRootId[resolvedId]
+            if (prev == null || score > prev.third) {
+                byRootId[resolvedId] = Triple(resolvedId, currentDisplayId, score)
             }
         }
-        return fallbackMatch
+        return byRootId.values.sortedByDescending { it.third }
+    }
+
+    private fun scoreMeetingTaskLine(line: String): Int {
+        val lower = line.lowercase(Locale.US)
+        val isActiveCallActivity = lower.contains("confactivity") ||
+            lower.contains("zmconf") ||
+            lower.contains("meetingactivity") ||
+            lower.contains("callactivity") ||
+            lower.contains("incall") ||
+            lower.contains("webexcall") ||
+            lower.contains("voip") ||
+            lower.contains("videocall")
+        val isVisible = lower.contains("visible=true")
+        return (if (isActiveCallActivity) 10 else 0) + (if (isVisible) 4 else 0) + 1
     }
 
     private fun lineMatchesPackage(line: String, packageName: String): Boolean {
@@ -1144,6 +1287,41 @@ data class SavedPublicVideoResult(
  */
 object MeetingMp4Muxer {
     private const val TAG = "MeetingMp4Muxer"
+
+    fun isValidMp4File(file: File?): Boolean {
+        if (file == null || !file.exists() || file.length() < 1024L) return false
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(file.absolutePath)
+            val videoTrack = findTrackIndex(extractor, "video/")
+            if (videoTrack < 0) return false
+            extractor.selectTrack(videoTrack)
+            extractor.sampleTrackIndex >= 0
+        } catch (_: Throwable) {
+            false
+        } finally {
+            runCatching { extractor.release() }
+        }
+    }
+
+    private fun extractMp4DurationMs(file: File): Long {
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(file.absolutePath)
+            var maxUs = 0L
+            for (i in 0 until extractor.trackCount) {
+                val fmt = extractor.getTrackFormat(i)
+                if (fmt.containsKey(MediaFormat.KEY_DURATION)) {
+                    maxUs = maxOf(maxUs, runCatching { fmt.getLong(MediaFormat.KEY_DURATION) }.getOrDefault(0L))
+                }
+            }
+            (maxUs / 1_000L).coerceAtLeast(0L)
+        } catch (_: Throwable) {
+            0L
+        } finally {
+            runCatching { extractor.release() }
+        }
+    }
 
     fun muxVideoAndAdtsAudio(
         videoOnlyMp4: File,
@@ -1208,7 +1386,7 @@ object MeetingMp4Muxer {
             val bufferRef = AtomicReference(ByteBuffer.allocateDirect(initialBufBytes))
             val info = MediaCodec.BufferInfo()
 
-            if (dstAudioTrack >= 0 && srcAudioTrack >= 0) {
+            val (vCount, aCount) = if (dstAudioTrack >= 0 && srcAudioTrack >= 0) {
                 interleaveTracksByPts(
                     videoExtractor = videoExtractor,
                     audioExtractor = audioExtractor,
@@ -1219,16 +1397,28 @@ object MeetingMp4Muxer {
                     info = info
                 )
             } else {
-                copyTrackSamples(videoExtractor, mp4Muxer, dstVideoTrack, bufferRef, info)
+                copyTrackSamples(videoExtractor, mp4Muxer, dstVideoTrack, bufferRef, info) to 0L
             }
 
             mp4Muxer.stop()
             mp4Muxer.release()
             muxer = null
 
-            val ok = outputMp4.exists() && outputMp4.length() > 1024L
-            Log.i(TAG, "Muxed meeting MP4: ${outputMp4.name} (${outputMp4.length()} bytes, audioMuxed=${dstAudioTrack >= 0}, buf=${bufferRef.get().capacity()}B, interleaved=true)")
-            ok
+            val ok = outputMp4.exists() && outputMp4.length() > 1024L && isValidMp4File(outputMp4)
+            Log.i(
+                TAG,
+                "Muxed meeting MP4: ${outputMp4.name} (${outputMp4.length()} bytes, vSamples=$vCount, aSamples=$aCount, valid=$ok, buf=${bufferRef.get().capacity()}B)"
+            )
+            if (ok) {
+                true
+            } else {
+                Log.w(TAG, "Post-mux MP4 validation failed; falling back to video-only copy")
+                runCatching { outputMp4.delete() }
+                runCatching {
+                    videoOnlyMp4.copyTo(outputMp4, overwrite = true)
+                    outputMp4.exists() && outputMp4.length() > 1024L
+                }.getOrDefault(false)
+            }
         } catch (t: Throwable) {
             Log.e(TAG, "MP4 audio+video mux failed; falling back to video-only copy", t)
             runCatching { muxer?.release() }
@@ -1282,11 +1472,13 @@ object MeetingMp4Muxer {
         dstAudioTrack: Int,
         bufferRef: AtomicReference<ByteBuffer>,
         info: MediaCodec.BufferInfo
-    ) {
+    ): Pair<Long, Long> {
         var videoDone = videoExtractor.sampleTrackIndex < 0
         var audioDone = audioExtractor.sampleTrackIndex < 0
         var lastVideoPtsUs = -1L
         var lastAudioPtsUs = -1L
+        var videoSamples = 0L
+        var audioSamples = 0L
 
         while (!videoDone || !audioDone) {
             val vPts = if (!videoDone) videoExtractor.sampleTime.coerceAtLeast(0L) else Long.MAX_VALUE
@@ -1296,7 +1488,17 @@ object MeetingMp4Muxer {
             val activeExtractor = if (writeVideo) videoExtractor else audioExtractor
             val dstTrack = if (writeVideo) dstVideoTrack else dstAudioTrack
 
-            val sampleSize = readSampleWithResize(activeExtractor, bufferRef)
+            val sampleSize = try {
+                readSampleWithResize(activeExtractor, bufferRef)
+            } catch (t: Throwable) {
+                if (!writeVideo && audioSamples > 0L) {
+                    // Truncated trailing ADTS frame after a forced stop — preserve all prior audio
+                    Log.w(TAG, "Stopping audio track gracefully after $audioSamples samples due to trailing read error: ${t.message}")
+                    audioDone = true
+                    continue
+                }
+                throw t
+            }
             if (sampleSize < 0) {
                 if (writeVideo) videoDone = true else audioDone = true
                 continue
@@ -1321,10 +1523,14 @@ object MeetingMp4Muxer {
             info.flags = mapExtractorFlags(activeExtractor.sampleFlags)
 
             muxer.writeSampleData(dstTrack, bufferRef.get(), info)
-            if (!activeExtractor.advance()) {
+            if (writeVideo) videoSamples++ else audioSamples++
+
+            val advanced = runCatching { activeExtractor.advance() }.getOrDefault(false)
+            if (!advanced) {
                 if (writeVideo) videoDone = true else audioDone = true
             }
         }
+        return videoSamples to audioSamples
     }
 
     private fun copyTrackSamples(
@@ -1333,8 +1539,9 @@ object MeetingMp4Muxer {
         dstTrackIndex: Int,
         bufferRef: AtomicReference<ByteBuffer>,
         info: MediaCodec.BufferInfo
-    ) {
+    ): Long {
         var lastPtsUs = -1L
+        var count = 0L
         while (true) {
             val sampleSize = readSampleWithResize(extractor, bufferRef)
             if (sampleSize < 0) break
@@ -1351,8 +1558,10 @@ object MeetingMp4Muxer {
             info.flags = mapExtractorFlags(extractor.sampleFlags)
 
             muxer.writeSampleData(dstTrackIndex, bufferRef.get(), info)
-            extractor.advance()
+            count++
+            if (!runCatching { extractor.advance() }.getOrDefault(false)) break
         }
+        return count
     }
 
     private fun mapExtractorFlags(sampleFlags: Int): Int {
@@ -1380,7 +1589,7 @@ object MeetingMp4Muxer {
     ): SavedPublicVideoResult {
         if (!sourceMp4.exists() || sourceMp4.length() < 1024L) return SavedPublicVideoResult()
 
-        val stamp = SimpleDateFormat("yyyy-MM-dd_HHmm", Locale.US).format(Date(startWallMs))
+        val stamp = SimpleDateFormat("yyyy-MM-dd_HHmmss", Locale.US).format(Date(startWallMs))
         val cleanTitle = meetingTitle
             .replace(Regex("[^A-Za-z0-9._ -]"), "_")
             .replace(Regex("\\s+"), "_")
@@ -1430,12 +1639,17 @@ object MeetingMp4Muxer {
             val resolver = context.contentResolver
             val createdUri = DocumentsContract.createDocument(resolver, parentDocUri, "video/mp4", fileName)
                 ?: return SavedPublicVideoResult()
-            resolver.openOutputStream(createdUri)?.use { out ->
+            val expectedLen = sourceMp4.length()
+            val copiedBytes = resolver.openOutputStream(createdUri)?.use { out ->
                 sourceMp4.inputStream().use { input ->
                     input.copyTo(out, bufferSize = 64 * 1024)
                 }
             } ?: return SavedPublicVideoResult()
-            Log.i(TAG, "Saved meeting MP4 to custom SAF folder '$folderLabel/$fileName' -> $createdUri")
+            if (copiedBytes < expectedLen) {
+                runCatching { DocumentsContract.deleteDocument(resolver, createdUri) }
+                throw IllegalStateException("Incomplete SAF copy ($copiedBytes / $expectedLen bytes)")
+            }
+            Log.i(TAG, "Saved meeting MP4 to custom SAF folder '$folderLabel/$fileName' ($copiedBytes B) -> $createdUri")
             SavedPublicVideoResult(
                 contentUri = createdUri.toString(),
                 displayPath = "$folderLabel/$fileName"
@@ -1462,29 +1676,38 @@ object MeetingMp4Muxer {
             MediaStore.Downloads.EXTERNAL_CONTENT_URI
         }
 
+        val durationMs = extractMp4DurationMs(sourceMp4)
         val resolver = context.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
             put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
             put(MediaStore.MediaColumns.RELATIVE_PATH, normalized)
             put(MediaStore.MediaColumns.IS_PENDING, 1)
+            if (isVideoCollection && durationMs > 0L) {
+                put(MediaStore.Video.Media.DURATION, durationMs)
+            }
         }
 
         val uri = runCatching { resolver.insert(collectionUri, values) }.getOrNull()
             ?: return SavedPublicVideoResult()
 
         return try {
-            resolver.openOutputStream(uri)?.use { out ->
+            val expectedLen = sourceMp4.length()
+            val copiedBytes = resolver.openOutputStream(uri)?.use { out ->
                 sourceMp4.inputStream().use { input ->
                     input.copyTo(out, bufferSize = 64 * 1024)
                 }
             } ?: throw IllegalStateException("Failed to open MediaStore output stream")
 
+            if (copiedBytes < expectedLen) {
+                throw IllegalStateException("Incomplete MediaStore copy ($copiedBytes / $expectedLen bytes)")
+            }
+
             val doneValues = ContentValues().apply {
                 put(MediaStore.MediaColumns.IS_PENDING, 0)
             }
             resolver.update(uri, doneValues, null, null)
-            Log.i(TAG, "Saved meeting MP4 to public folder '$normalized/$fileName' -> $uri")
+            Log.i(TAG, "Saved meeting MP4 to public folder '$normalized/$fileName' ($copiedBytes B, dur=${durationMs}ms) -> $uri")
             SavedPublicVideoResult(
                 contentUri = uri.toString(),
                 displayPath = "$normalized/$fileName"

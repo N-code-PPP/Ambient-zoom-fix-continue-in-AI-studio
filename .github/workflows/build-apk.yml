@@ -238,12 +238,95 @@ jobs:
             rm -rf /tmp/gw-bootstrap
           fi
 
+      - name: Resolve Next App Version & Release Tag (Auto-Increment per Successful Release)
+        id: app_version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - << 'PY'
+          import json, os, re, subprocess
+
+          with open("app/build.gradle.kts", "r", encoding="utf-8") as f:
+              gradle_txt = f.read()
+
+          m_name = re.search(r'(?:baseVersionName|versionName)\s*=\s*"(\d+)\.(\d+)\.(\d+)"', gradle_txt)
+          if not m_name:
+              raise RuntimeError("Could not parse base semantic versionName (X.Y.Z) from app/build.gradle.kts")
+          base_major, base_minor, base_patch = int(m_name.group(1)), int(m_name.group(2)), int(m_name.group(3))
+
+          m_code = re.search(r'(?:baseVersionCode|versionCode)\s*=\s*(\d+)', gradle_txt)
+          base_code = int(m_code.group(1)) if m_code else 19
+          base_tuple = (base_major, base_minor, base_patch)
+
+          published_versions = set()
+          published_tags = set()
+          repo = os.environ.get("GH_REPO", "")
+
+          # Only count successful (non-draft) published GitHub Releases so failed builds never consume a version
+          gh_cmd = ["gh", "release", "list", "--limit", "1000", "--json", "tagName,isDraft"]
+          if repo:
+              gh_cmd.extend(["--repo", repo])
+          gh_res = subprocess.run(gh_cmd, capture_output=True, text=True)
+          if gh_res.returncode == 0 and gh_res.stdout.strip():
+              try:
+                  for item in json.loads(gh_res.stdout):
+                      if item.get("isDraft"):
+                          continue
+                      tag = (item.get("tagName") or "").strip()
+                      if not tag:
+                          continue
+                      published_tags.add(tag)
+                      m_tag = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", tag)
+                      if m_tag:
+                          published_versions.add((int(m_tag.group(1)), int(m_tag.group(2)), int(m_tag.group(3))))
+              except Exception as exc:
+                  print(f"Warning: could not parse gh release list output: {exc}")
+
+          # Start from base_tuple (e.g., 1.1.9) and advance patch if already published on GitHub Releases
+          higher_or_equal = [v for v in published_versions if v >= base_tuple]
+          if not higher_or_equal:
+              next_major, next_minor, next_patch = base_tuple
+              next_code = base_code
+          else:
+              max_v = max(higher_or_equal)
+              next_major, next_minor, next_patch = max_v[0], max_v[1], max_v[2] + 1
+              while (next_major, next_minor, next_patch) in published_versions:
+                  next_patch += 1
+              # Strictly monotonic versionCode anchored to base_code + count of releases >= base
+              same_line_delta = (next_patch - base_patch) if (next_major, next_minor) == (base_major, base_minor) else 0
+              next_code = base_code + max(len(higher_or_equal), same_line_delta)
+
+          next_version = f"{next_major}.{next_minor}.{next_patch}"
+          next_tag = f"v{next_version}"
+          while next_tag in published_tags or next_version in published_tags:
+              next_patch += 1
+              next_code += 1
+              next_version = f"{next_major}.{next_minor}.{next_patch}"
+              next_tag = f"v{next_version}"
+
+          print(f"Base gradle version: {base_major}.{base_minor}.{base_patch} (versionCode {base_code})")
+          print(f"Published semantic releases found: {len(published_versions)}")
+          print(f"Resolved build version: {next_version} (versionCode {next_code}, tag {next_tag})")
+
+          github_output = os.environ.get("GITHUB_OUTPUT")
+          if not github_output:
+              raise RuntimeError("GITHUB_OUTPUT is not set")
+          with open(github_output, "a", encoding="utf-8") as f:
+              f.write(f"version_name={next_version}\n")
+              f.write(f"version_code={next_code}\n")
+              f.write(f"tag={next_tag}\n")
+          PY
+
       - name: Build APK(s)
         env:
           CI_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           CI_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           CI_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
           INCLUDE_DEBUG: ${{ inputs.include_debug == true }}
+          APP_VERSION_NAME: ${{ steps.app_version.outputs.version_name }}
+          APP_VERSION_CODE: ${{ steps.app_version.outputs.version_code }}
         run: |
           if [ -n "${CI_KEYSTORE_PASSWORD}" ]; then export KEYSTORE_PASSWORD="${CI_KEYSTORE_PASSWORD}"; fi
           if [ -n "${CI_KEY_ALIAS}" ]; then export KEY_ALIAS="${CI_KEY_ALIAS}"; fi
@@ -253,18 +336,21 @@ jobs:
           if [ "${INCLUDE_DEBUG}" = "true" ]; then
             TASKS="assembleRelease assembleDebug"
           fi
-          echo "Running Gradle tasks: ${TASKS}"
+          VERSION_FLAGS="-PappVersionCode=${APP_VERSION_CODE} -PappVersionName=${APP_VERSION_NAME}"
+          echo "Running Gradle tasks: ${TASKS} (${VERSION_FLAGS})"
 
           if [ -f gradle/wrapper/gradle-wrapper.jar ] && unzip -tq gradle/wrapper/gradle-wrapper.jar >/dev/null 2>&1; then
-            ./gradlew ${TASKS} --build-cache --parallel --stacktrace --no-daemon
+            ./gradlew ${TASKS} ${VERSION_FLAGS} --build-cache --parallel --stacktrace --no-daemon
           else
-            gradle ${TASKS} --build-cache --parallel --stacktrace --no-daemon
+            gradle ${TASKS} ${VERSION_FLAGS} --build-cache --parallel --stacktrace --no-daemon
           fi
 
       - name: Prepare APK Artifacts (No Double Zip)
         id: package_apk
         env:
           INCLUDE_DEBUG: ${{ inputs.include_debug == true }}
+          APP_VERSION_NAME: ${{ steps.app_version.outputs.version_name }}
+          APP_VERSION_CODE: ${{ steps.app_version.outputs.version_code }}
         run: |
           COMMIT_ID=$(git rev-parse --short HEAD)
           rm -rf staging
@@ -277,7 +363,7 @@ jobs:
             echo "::error::Release APK was not generated under app/build/outputs/apk/release"
             exit 1
           fi
-          cp "$REL_APK" "staging/ambient-brain-${COMMIT_ID}-release.apk"
+          cp "$REL_APK" "staging/ambient-brain-v${APP_VERSION_NAME}-${COMMIT_ID}-release.apk"
 
           HAS_DEBUG="false"
           if [ "${INCLUDE_DEBUG}" = "true" ]; then
@@ -287,12 +373,14 @@ jobs:
               echo "::error::Debug APK was not generated under app/build/outputs/apk/debug"
               exit 1
             fi
-            cp "$DBG_APK" "staging/ambient-brain-${COMMIT_ID}-debug.apk"
+            cp "$DBG_APK" "staging/ambient-brain-v${APP_VERSION_NAME}-${COMMIT_ID}-debug.apk"
             HAS_DEBUG="true"
           fi
 
           {
             echo "Project: Ambient Brain (Android)"
+            echo "Package: com.ambientbrain.recorder"
+            echo "App Version: ${APP_VERSION_NAME} (versionCode ${APP_VERSION_CODE})"
             echo "Commit ID: ${GITHUB_SHA}"
             echo "Commit Short: ${COMMIT_ID}"
             echo "Ref: ${GITHUB_REF}"
@@ -304,77 +392,14 @@ jobs:
           echo "has_debug=${HAS_DEBUG}" >> "$GITHUB_OUTPUT"
           ls -lh staging/
 
-      - name: Calculate Next Release Tag (1.01, 1.02, ...)
-        id: next_tag
-        if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          python3 - << 'PY'
-          import subprocess, re, os, json
-
-          repo = os.environ.get("GH_REPO", "")
-          subprocess.run(["git", "fetch", "--tags", "--force"], capture_output=True)
-          tags = set()
-
-          res_local = subprocess.run(["git", "tag", "-l"], capture_output=True, text=True)
-          for line in res_local.stdout.splitlines():
-              t = line.strip()
-              if t:
-                  tags.add(t)
-
-          res_remote = subprocess.run(["git", "ls-remote", "--tags", "origin"], capture_output=True, text=True)
-          for line in res_remote.stdout.splitlines():
-              parts = line.strip().split("\t")
-              if len(parts) == 2 and parts[1].startswith("refs/tags/"):
-                  t = parts[1][len("refs/tags/"):].removesuffix("^{}")
-                  if t:
-                      tags.add(t)
-
-          gh_cmd = ["gh", "release", "list", "--limit", "1000", "--json", "tagName"]
-          if repo:
-              gh_cmd.extend(["--repo", repo])
-          gh_res = subprocess.run(gh_cmd, capture_output=True, text=True)
-          if gh_res.returncode == 0 and gh_res.stdout.strip():
-              try:
-                  for item in json.loads(gh_res.stdout):
-                      t = item.get("tagName", "").strip()
-                      if t:
-                          tags.add(t)
-              except Exception:
-                  pass
-
-          max_num = 0
-          for t in tags:
-              m = re.match(r"^v?1\.(\d+)$", t)
-              if m:
-                  num = int(m.group(1))
-                  if num > max_num:
-                      max_num = num
-
-          next_num = max_num + 1 if max_num >= 1 else 1
-          next_tag = f"1.{next_num:02d}"
-          while next_tag in tags:
-              next_num += 1
-              next_tag = f"1.{next_num:02d}"
-
-          print(f"Existing tags/releases count: {len(tags)}")
-          print(f"Calculated next tag: {next_tag}")
-
-          github_output = os.environ.get("GITHUB_OUTPUT")
-          if not github_output:
-              raise RuntimeError("GITHUB_OUTPUT is not set")
-          with open(github_output, "a", encoding="utf-8") as f:
-              f.write(f"tag={next_tag}\n")
-          PY
-
       - name: Create GitHub Release & Attach APK Files
         if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ steps.next_tag.outputs.tag }}
+          TAG: ${{ steps.app_version.outputs.tag }}
+          APP_VERSION_NAME: ${{ steps.app_version.outputs.version_name }}
+          APP_VERSION_CODE: ${{ steps.app_version.outputs.version_code }}
           COMMIT_ID: ${{ steps.package_apk.outputs.commit_id }}
           HAS_DEBUG: ${{ steps.package_apk.outputs.has_debug }}
         run: |
@@ -398,23 +423,30 @@ jobs:
           python3 - << 'PY'
           import os
           tag = os.environ["TAG"]
+          ver_name = os.environ["APP_VERSION_NAME"]
+          ver_code = os.environ["APP_VERSION_CODE"]
           commit_id = os.environ["COMMIT_ID"]
           sha = os.environ.get("GITHUB_SHA", commit_id)
           repo = os.environ.get("GH_REPO", "")
           has_debug = os.environ.get("HAS_DEBUG") == "true"
 
+          rel_name = f"ambient-brain-v{ver_name}-{commit_id}-release.apk"
+          dbg_name = f"ambient-brain-v{ver_name}-{commit_id}-debug.apk"
+
           links = [
-              f"- **[Download Signed Release APK (arm64-v8a)](https://github.com/{repo}/releases/download/{tag}/ambient-brain-{commit_id}-release.apk)** (Recommended for 24/7 background capture)"
+              f"- **[Download Signed Release APK v{ver_name} (arm64-v8a)](https://github.com/{repo}/releases/download/{tag}/{rel_name})** (Recommended for 24/7 background capture)"
           ]
-          assets = [f"- `ambient-brain-{commit_id}-release.apk`"]
+          assets = [f"- `{rel_name}`"]
           if has_debug:
               links.append(
-                  f"- **[Download Debug APK](https://github.com/{repo}/releases/download/{tag}/ambient-brain-{commit_id}-debug.apk)**"
+                  f"- **[Download Debug APK v{ver_name}](https://github.com/{repo}/releases/download/{tag}/{dbg_name})**"
               )
-              assets.append(f"- `ambient-brain-{commit_id}-debug.apk`")
+              assets.append(f"- `{dbg_name}`")
 
           notes = (
-              f"### 🧠 Ambient Brain Release {tag}\n"
+              f"### 🧠 Ambient Brain {tag}\n"
+              f"**Package ID:** `com.ambientbrain.recorder`\n"
+              f"**App Version:** `{ver_name}` (`versionCode {ver_code}`)\n"
               f"**Target Platform:** Modern Android (Android 14+, arm64-v8a)\n"
               f"**Commit:** `{sha}` (`{commit_id}`)\n\n"
               f"#### 📲 Direct 1-Tap APK Downloads (No Zip Extraction Needed):\n"
@@ -427,8 +459,8 @@ jobs:
               f.write(notes)
           PY
 
-          RELEASE_TITLE="Release ${TAG} (${COMMIT_ID})"
-          echo "Publishing release $TAG with title '$RELEASE_TITLE' and direct APK files: ${FILES[*]}"
+          RELEASE_TITLE="Ambient Brain ${TAG} (${COMMIT_ID})"
+          echo "Publishing release $TAG (version $APP_VERSION_NAME / code $APP_VERSION_CODE) with direct APK files: ${FILES[*]}"
           if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
             gh release upload "$TAG" "${FILES[@]}" --clobber --repo "$GH_REPO"
           else

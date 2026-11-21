@@ -46,6 +46,7 @@ import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.BluetoothAudio
 import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
@@ -65,10 +66,13 @@ import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RadioButtonChecked
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.ScreenRotation
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
@@ -180,6 +184,7 @@ fun MeetingRecorderDialog(
     var enableVirtualMic by rememberSaveable { mutableStateOf(meetingState.enableVirtualMic) }
     var keepAmbientBrainListening by rememberSaveable { mutableStateOf(meetingState.keepAmbientBrainListening) }
     var showMiniPreviewOnStart by rememberSaveable { mutableStateOf(false) }
+    var landscapeVirtualScreen by rememberSaveable { mutableStateOf(prefs.meetingVirtualScreenLandscape) }
     var startWithSpeakerphone by rememberSaveable { mutableStateOf(false) }
     var autoSwitchToApp by rememberSaveable { mutableStateOf(false) }
     var showAppPickerDialog by remember { mutableStateOf(false) }
@@ -253,6 +258,7 @@ fun MeetingRecorderDialog(
                 silentSpeaker = silentSpeakerIsolation,
                 keepAmbientBrainListening = keepAmbientBrainListening,
                 showMiniPreviewOnStart = showMiniPreviewOnStart,
+                landscapeVirtualScreen = landscapeVirtualScreen,
                 enableSpeakerphoneBoost = selectedCaptureMode == MeetingAudioCaptureMode.MIC_SPEAKERPHONE ||
                     (selectedCaptureMode == MeetingAudioCaptureMode.INTERNAL_AND_MIC && startWithSpeakerphone),
                 projectionResultCode = result.resultCode,
@@ -341,6 +347,7 @@ fun MeetingRecorderDialog(
                 silentSpeaker = silentSpeakerIsolation,
                 keepAmbientBrainListening = keepAmbientBrainListening,
                 showMiniPreviewOnStart = showMiniPreviewOnStart,
+                landscapeVirtualScreen = landscapeVirtualScreen,
                 enableSpeakerphoneBoost = selectedCaptureMode == MeetingAudioCaptureMode.MIC_SPEAKERPHONE
             )
             Toast.makeText(
@@ -689,6 +696,14 @@ fun MeetingRecorderDialog(
                             onToggleMiniPreview = {
                                 MeetingRecorderService.toggleMiniPreview(context)
                             },
+                            onRebindStealthAudio = {
+                                MeetingRecorderService.rebindStealthAudio(context)
+                                Toast.makeText(
+                                    context,
+                                    "Re-syncing isolated audio loopback...",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            },
                             onLaunchMeetingApp = {
                                 val launched = MeetingRecorderService.launchMeetingApp(
                                     context = context,
@@ -756,6 +771,11 @@ fun MeetingRecorderDialog(
                             onKeepAmbientBrainListeningChange = { keepAmbientBrainListening = it },
                             showMiniPreviewOnStart = showMiniPreviewOnStart,
                             onShowMiniPreviewOnStartChange = { showMiniPreviewOnStart = it },
+                            landscapeVirtualScreen = landscapeVirtualScreen,
+                            onLandscapeVirtualScreenChange = { enabled ->
+                                landscapeVirtualScreen = enabled
+                                prefs.meetingVirtualScreenLandscape = enabled
+                            },
                             saveFolderDisplay = saveFolderDisplay,
                             onChangeSaveFolder = {
                                 onDismissRequest()
@@ -818,6 +838,8 @@ private fun IdleMeetingSetupBody(
     onKeepAmbientBrainListeningChange: (Boolean) -> Unit,
     showMiniPreviewOnStart: Boolean,
     onShowMiniPreviewOnStartChange: (Boolean) -> Unit,
+    landscapeVirtualScreen: Boolean,
+    onLandscapeVirtualScreenChange: (Boolean) -> Unit,
     saveFolderDisplay: String,
     onChangeSaveFolder: () -> Unit,
     ignoreInternalAppAudioForGemini: Boolean,
@@ -1256,6 +1278,41 @@ private fun IdleMeetingSetupBody(
                     }
                     Switch(checked = showMiniPreviewOnStart, onCheckedChange = onShowMiniPreviewOnStartChange)
                 }
+
+                HorizontalDivider(
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
+                    modifier = Modifier.padding(vertical = 4.dp)
+                )
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ScreenRotation,
+                        contentDescription = null,
+                        tint = Color(0xFF34D399),
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "16:9 Landscape Virtual Screen (1280×720)",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "Best for Zoom/Webex presentation slides & screen shares without letterboxing",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = landscapeVirtualScreen,
+                        onCheckedChange = onLandscapeVirtualScreenChange,
+                        modifier = Modifier.testTag("landscape_virtual_screen_switch")
+                    )
+                }
             }
         }
     }
@@ -1344,6 +1401,45 @@ private fun IdleMeetingSetupBody(
                                 }
                             }
                         }
+                    }
+                }
+            }
+            if (selectedVideoMode == MeetingVideoMode.ADB_VIRTUAL_SCREEN) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ScreenRotation,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "16:9 Landscape Virtual Screen (1280×720)",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "Best for Zoom/Webex presentation slides & screen shares without letterboxing",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = landscapeVirtualScreen,
+                            onCheckedChange = onLandscapeVirtualScreenChange,
+                            modifier = Modifier.testTag("landscape_virtual_screen_nonstealth_switch")
+                        )
                     }
                 }
             }
@@ -1678,6 +1774,7 @@ private fun ActiveMeetingRecordingBody(
     onMoveToVirtualScreen: () -> Unit,
     onBringToMainScreen: () -> Unit,
     onToggleMiniPreview: () -> Unit,
+    onRebindStealthAudio: () -> Unit,
     onLaunchMeetingApp: () -> Unit,
     onStopAndSave: () -> Unit
 ) {
@@ -1943,6 +2040,37 @@ private fun ActiveMeetingRecordingBody(
                     }
                 }
 
+                if (state.videoMode == MeetingVideoMode.ADB_VIRTUAL_SCREEN &&
+                    state.virtualDisplayId != null &&
+                    state.targetAppOnVirtualDisplay == false
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = Color(0xFF78350F).copy(alpha = 0.45f),
+                        border = BorderStroke(1.dp, Color(0xFFF59E0B).copy(alpha = 0.7f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = Color(0xFFFBBF24),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "$appShortName is currently on Main Screen — tap 'Send to Virtual' so its video stays recorded.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color(0xFFFDE68A),
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
+
                 if (state.videoMode == MeetingVideoMode.ADB_VIRTUAL_SCREEN && state.virtualDisplayId != null) {
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -2112,7 +2240,11 @@ private fun ActiveMeetingRecordingBody(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "No Internal Playback Signal Detected Yet",
+                        text = if (state.captureMode.usesAdbStealthAudio) {
+                            "No Isolated Audio Signal Detected Yet"
+                        } else {
+                            "No Internal Playback Signal Detected Yet"
+                        },
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold,
                         color = Color(0xFFFDE68A)
@@ -2120,11 +2252,37 @@ private fun ActiveMeetingRecordingBody(
                 }
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "$appDisplayName may be routing remote voices on Android's protected VoIP channel (USAGE_VOICE_COMMUNICATION). Enable Speakerphone Boost below so your mic captures remote speakers too.",
+                    text = if (state.captureMode.usesAdbStealthAudio) {
+                        "If you joined $appDisplayName audio before starting Stealth Mode, or have a Bluetooth headset connected, disconnect & reconnect meeting audio (or disconnect Bluetooth SCO) so Android routes VoIP onto the silent loopback."
+                    } else {
+                        "$appDisplayName may be routing remote voices on Android's protected VoIP channel (USAGE_VOICE_COMMUNICATION). Enable Speakerphone Boost below so your mic captures remote speakers too."
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = Color(0xFFFEF3C7).copy(alpha = 0.9f)
                 )
-                if (state.captureMode.needsMic) {
+                if (state.captureMode.usesAdbStealthAudio) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                        onClick = onRebindStealthAudio,
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFFF59E0B),
+                            contentColor = Color(0xFF0F172A)
+                        ),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        modifier = Modifier
+                            .height(34.dp)
+                            .testTag("rebind_stealth_audio_button")
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Re-sync Isolated Audio",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                } else if (state.captureMode.needsMic) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Button(
                         onClick = onToggleSpeakerphone,
@@ -2145,6 +2303,76 @@ private fun ActiveMeetingRecordingBody(
                         )
                     }
                 }
+            }
+        }
+    }
+
+    // 4b. Live Bluetooth SCO / LE Audio Routing Warning
+    if (state.bluetoothScoActive && (state.captureMode.usesAdbStealthAudio || state.captureMode.needsMediaProjection)) {
+        Card(
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = Color(0xFF1E3A5F).copy(alpha = 0.55f)
+            ),
+            border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.65f)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.BluetoothAudio,
+                        contentDescription = null,
+                        tint = Color(0xFF38BDF8),
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Bluetooth Call Audio Active",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFBAE6FD)
+                    )
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = if (state.captureMode.usesAdbStealthAudio) {
+                        "Bluetooth SCO/LE Audio is active. Some devices route $appDisplayName directly to Bluetooth, bypassing silent loopback. Disconnect BT and tap 'Re-sync Isolated Audio' if the meter stays silent."
+                    } else {
+                        "Bluetooth SCO/LE Audio is active. If internal app audio stays silent, switch $appDisplayName audio to Phone Speaker or enable Speakerphone Boost."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFE0F2FE).copy(alpha = 0.9f)
+                )
+            }
+        }
+    }
+
+    // 4c. Live Low Storage Safety Warning
+    state.lowStorageWarning?.let { storageWarn ->
+        Card(
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.8f)
+            ),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.6f)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                verticalAlignment = Alignment.Top,
+                modifier = Modifier.padding(10.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Storage,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = storageWarn,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer
+                )
             }
         }
     }

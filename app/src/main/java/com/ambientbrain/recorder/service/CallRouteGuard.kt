@@ -79,6 +79,9 @@ class CallRouteGuard(context: Context) {
         private set
 
     @Volatile
+    private var suppressedStealthVoipCall: Boolean = false
+
+    @Volatile
     var needsStreamReopen: Boolean = false
 
     @Volatile
@@ -215,27 +218,44 @@ class CallRouteGuard(context: Context) {
         }
     }
 
+    val isEffectivePhoneCall: Boolean
+        get() = isInCallMode && !suppressedStealthVoipCall
+
     private val modeListener = AudioManager.OnModeChangedListener { mode ->
         val nowInCall = isCallAudioMode(mode)
-        if (nowInCall != isInCallMode) {
+        val escalatedToCellularCall = nowInCall && suppressedStealthVoipCall && mode != AudioManager.MODE_IN_COMMUNICATION
+        if (nowInCall != isInCallMode || escalatedToCellularCall) {
             isInCallMode = nowInCall
-            val eventType = if (nowInCall) "CALL_STARTED" else "CALL_ENDED"
-            val now = System.currentTimeMillis()
-            synchronized(callEvents) {
-                callEvents.add(
-                    CallMarkerEvent(
-                        type = eventType,
-                        epochMs = now,
-                        sessionOffsetMs = (now - sessionStartEpochMs).coerceAtLeast(0L),
-                        audioMode = mode
-                    )
-                )
+            val stealthParallel = MeetingRecorderStateBus.isStealthParallelAmbientActive()
+            val suppressTransition = if (nowInCall && stealthParallel && mode == AudioManager.MODE_IN_COMMUNICATION) {
+                suppressedStealthVoipCall = true
+                true
+            } else if (!nowInCall && suppressedStealthVoipCall) {
+                suppressedStealthVoipCall = false
+                true
+            } else {
+                suppressedStealthVoipCall = false
+                false
             }
-            Log.i(TAG, "Audio mode changed to $mode ($eventType)")
-            // Trigger stream reopen if switching into/out of call mode so HAL picks up the active route
-            needsStreamReopen = true
-            CaptureStateBus.update {
-                it.copy(isInPhoneCall = nowInCall)
+            val eventType = if (nowInCall) "CALL_STARTED" else "CALL_ENDED"
+            Log.i(TAG, "Audio mode changed to $mode ($eventType, suppressStealthVoip=$suppressTransition)")
+            if (!suppressTransition) {
+                val now = System.currentTimeMillis()
+                synchronized(callEvents) {
+                    callEvents.add(
+                        CallMarkerEvent(
+                            type = eventType,
+                            epochMs = now,
+                            sessionOffsetMs = (now - sessionStartEpochMs).coerceAtLeast(0L),
+                            audioMode = mode
+                        )
+                    )
+                }
+                // Trigger stream reopen if switching into/out of real call mode so HAL picks up the active route
+                needsStreamReopen = true
+                CaptureStateBus.update {
+                    it.copy(isInPhoneCall = isEffectivePhoneCall)
+                }
             }
             onRecordingStateChanged?.invoke()
         }
@@ -288,10 +308,11 @@ class CallRouteGuard(context: Context) {
             if (!stealthParallel) {
                 isExternalClientExemptedStealth = false
             }
-            if (silencedChanged || externalChanged || lastShizukuExternalClient == null) {
+            val unresolvedExternal = lastShizukuExternalClient == null && !isExternalClientExemptedStealth
+            if (silencedChanged || externalChanged || unresolvedExternal) {
                 scheduleShizukuMicOwnerInspection(
                     configs = configs,
-                    bypassCooldown = stealthParallel && externalChanged
+                    bypassCooldown = stealthParallel && (externalChanged || silencedChanged)
                 )
             }
         }
@@ -347,6 +368,9 @@ class CallRouteGuard(context: Context) {
     fun startMonitoring() {
         val currentMode = audioManager.mode
         isInCallMode = isCallAudioMode(currentMode)
+        suppressedStealthVoipCall = isInCallMode &&
+            currentMode == AudioManager.MODE_IN_COMMUNICATION &&
+            MeetingRecorderStateBus.isStealthParallelAmbientActive()
         initialDeviceCallbackDone = false
         val exec = getOrCreateExecutor()
         runCatching {
@@ -361,7 +385,7 @@ class CallRouteGuard(context: Context) {
         refreshActiveRecordingState()
         CaptureStateBus.update {
             it.copy(
-                isInPhoneCall = isInCallMode,
+                isInPhoneCall = isEffectivePhoneCall,
                 isMicSilencedByOs = isSilencedBySystem,
                 isExternalMicActive = externalRecordingActive,
                 externalMicOwnerPackage = lastShizukuExternalClient?.packageName,
@@ -387,6 +411,7 @@ class CallRouteGuard(context: Context) {
         externalRecordingCount = 0
         lastShizukuExternalClient = null
         isExternalClientExemptedStealth = false
+        suppressedStealthVoipCall = false
         CaptureStateBus.update {
             it.copy(
                 isMicSilencedByOs = false,
@@ -409,9 +434,12 @@ class CallRouteGuard(context: Context) {
     fun refreshActiveRecordingState(): Boolean {
         val currentMode = audioManager.mode
         val nowInCall = isCallAudioMode(currentMode)
-        if (nowInCall != isInCallMode) {
+        val stealthParallel = MeetingRecorderStateBus.isStealthParallelAmbientActive()
+        val escalatedToCellularCall = nowInCall && suppressedStealthVoipCall && currentMode != AudioManager.MODE_IN_COMMUNICATION
+        if (nowInCall != isInCallMode || escalatedToCellularCall) {
             isInCallMode = nowInCall
-            CaptureStateBus.update { it.copy(isInPhoneCall = nowInCall) }
+            suppressedStealthVoipCall = nowInCall && stealthParallel && currentMode == AudioManager.MODE_IN_COMMUNICATION
+            CaptureStateBus.update { it.copy(isInPhoneCall = isEffectivePhoneCall) }
         }
         val configs = runCatching { audioManager.activeRecordingConfigurations }.getOrNull()
         if (configs != null) {
@@ -424,7 +452,7 @@ class CallRouteGuard(context: Context) {
         sessionStartEpochMs = startEpochMs
         synchronized(callEvents) {
             callEvents.clear()
-            if (isInCallMode) {
+            if (isEffectivePhoneCall) {
                 callEvents.add(
                     CallMarkerEvent(
                         type = "CALL_ACTIVE_AT_START",
@@ -439,7 +467,7 @@ class CallRouteGuard(context: Context) {
 
     fun getCallEventsSnapshot(): Pair<Boolean, String?> {
         synchronized(callEvents) {
-            if (callEvents.isEmpty() && !isInCallMode) return false to null
+            if (callEvents.isEmpty() && !isEffectivePhoneCall) return false to null
             return true to Json.encodeToString(callEvents.toList())
         }
     }

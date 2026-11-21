@@ -582,6 +582,22 @@ class PreferencesRepo(private val context: Context) {
                 .commit()
         }
 
+    var meetingVirtualScreenLandscape: Boolean
+        get() = prefs.getBoolean(KEY_MEETING_VIRTUAL_SCREEN_LANDSCAPE, false)
+        set(value) = prefs.edit().putBoolean(KEY_MEETING_VIRTUAL_SCREEN_LANDSCAPE, value).apply()
+
+    /**
+     * Crash-recovery JSON checkpoint for an active meeting recording (committed synchronously so
+     * OOM-kill or sudden power loss can recover intact ADTS audio / valid MP4 on next startup).
+     */
+    var pendingMeetingRecoveryJson: String
+        get() = prefs.getString(KEY_PENDING_MEETING_RECOVERY_JSON, "")?.trim().orEmpty()
+        set(value) {
+            prefs.edit()
+                .putString(KEY_PENDING_MEETING_RECOVERY_JSON, value.trim())
+                .commit()
+        }
+
     var userDisplayName: String
         get() = prefs.getString(KEY_USER_DISPLAY_NAME, "Dr. (Me)") ?: "Dr. (Me)"
         set(value) = prefs.edit().putString(KEY_USER_DISPLAY_NAME, value.trim()).apply()
@@ -2158,6 +2174,8 @@ class PreferencesRepo(private val context: Context) {
         private const val KEY_MEETING_VIDEO_CUSTOM_TREE_URI = "meeting_video_custom_tree_uri"
         private const val KEY_MEETING_VIDEO_CUSTOM_FOLDER_LABEL = "meeting_video_custom_folder_label"
         private const val KEY_PENDING_APPOPS_MIC_RESTORE_PKG = "pending_appops_mic_restore_pkg"
+        private const val KEY_MEETING_VIRTUAL_SCREEN_LANDSCAPE = "meeting_virtual_screen_landscape"
+        private const val KEY_PENDING_MEETING_RECOVERY_JSON = "pending_meeting_recovery_json"
         private const val KEY_GEMINI_PAUSED = "gemini_usage_paused"
         private const val KEY_GEMINI_PAUSED_UNTIL_MS = "gemini_usage_paused_until_ms"
         private const val KEY_USE_DEFAULT_RATE_LIMIT_REF = "use_default_rate_limit_reference"

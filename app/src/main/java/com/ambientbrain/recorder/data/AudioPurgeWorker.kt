@@ -7,9 +7,11 @@ import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import com.ambientbrain.recorder.service.AdbVirtualScreenController
 import com.ambientbrain.recorder.service.AmbientCaptureAccessibilityService
 import com.ambientbrain.recorder.service.MeetingMetadataHelper
 import com.ambientbrain.recorder.service.MeetingRecorderStateBus
+import com.ambientbrain.recorder.service.MeetingRecoveryManager
 import com.ambientbrain.recorder.service.ShizukuAdbManager
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -107,18 +109,34 @@ class AudioPurgeWorker(
             }
         }
 
-        // Reclaim orphaned Stealth ADB temp media/preview files left behind by an OS kill/OOM
+        // Recover any unfinished meeting recording from a prior crash/OOM BEFORE sweeping orphan temp files
         val meetingState = MeetingRecorderStateBus.state.value
         if (!meetingState.isRecording && !meetingState.isFinalizing) {
+            runCatching { MeetingRecoveryManager.recoverUnfinishedSessionIfAny(applicationContext) }
+            val protectedPaths = MeetingRecoveryManager.getProtectedTempPaths(applicationContext)
             val sixHoursAgo = nowMs - TimeUnit.HOURS.toMillis(6)
             runCatching {
                 applicationContext.externalCacheDir?.listFiles()?.forEach { file ->
+                    val canonical = runCatching { file.canonicalPath }.getOrNull() ?: file.absolutePath
+                    if (canonical in protectedPaths) return@forEach
                     val name = file.name
-                    val isStealthTemp = name.startsWith("adb_vdisp_") ||
+                    val isStealthTemp = name.startsWith("vdisp_") ||
+                        name.startsWith("vdisp_audio_") ||
+                        name.startsWith("adb_vdisp_") ||
                         name.startsWith("adb_vaud_") ||
                         name.startsWith("preview_") ||
                         name.endsWith(".tmp")
                     if (isStealthTemp && file.lastModified() < sixHoursAgo) {
+                        AdbVirtualScreenController.deleteTempFileBestEffort(applicationContext, file)
+                    }
+                }
+            }
+            runCatching {
+                applicationContext.cacheDir.listFiles()?.forEach { file ->
+                    val canonical = runCatching { file.canonicalPath }.getOrNull() ?: file.absolutePath
+                    if (canonical in protectedPaths) return@forEach
+                    val name = file.name
+                    if (name.startsWith("mp_video_") && name.endsWith(".mp4") && file.lastModified() < sixHoursAgo) {
                         file.delete()
                     }
                 }

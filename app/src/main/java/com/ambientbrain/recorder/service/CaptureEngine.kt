@@ -1306,7 +1306,7 @@ class CaptureEngine(private val context: Context) {
                     isListeningEnabled = true,
                     currentSessionElapsedSec = 0L,
                     lastVadProbability = 0f,
-                    isInPhoneCall = callGuard.isInCallMode,
+                    isInPhoneCall = callGuard.isEffectivePhoneCall,
                     isMicSilencedByOs = false,
                     isExternalMicActive = callGuard.externalRecordingActive,
                     pauseReason = initialReason,
@@ -1333,7 +1333,7 @@ class CaptureEngine(private val context: Context) {
                         isListeningEnabled = true,
                         currentSessionElapsedSec = 0L,
                         lastVadProbability = 0f,
-                        isInPhoneCall = callGuard.isInCallMode,
+                        isInPhoneCall = callGuard.isEffectivePhoneCall,
                         isMicSilencedByOs = callGuard.isSilencedBySystem,
                         isExternalMicActive = callGuard.externalRecordingActive,
                         pauseReason = activeReason,
@@ -1462,7 +1462,7 @@ class CaptureEngine(private val context: Context) {
                                     status = LiveCaptureStatus.PAUSED,
                                     isListeningEnabled = true,
                                     pauseReason = "Waiting for microphone...",
-                                    isInPhoneCall = callGuard.isInCallMode,
+                                    isInPhoneCall = callGuard.isEffectivePhoneCall,
                                     isExternalMicActive = callGuard.externalRecordingActive,
                                     isAccessibilityBound = AmbientCaptureAccessibilityService.isSystemBound,
                                     isAccessibilityOverlayAttached = AmbientCaptureAccessibilityService.isOverlayAttached,
@@ -1656,7 +1656,7 @@ class CaptureEngine(private val context: Context) {
                 val liveStatus = when {
                     !effectiveListening -> LiveCaptureStatus.STOPPED
                     callGuard.isSilencedBySystem -> LiveCaptureStatus.MIC_SILENCED_WARNING
-                    callGuard.isInCallMode && sessionId != null -> LiveCaptureStatus.RECORDING_IN_CALL
+                    callGuard.isEffectivePhoneCall && sessionId != null -> LiveCaptureStatus.RECORDING_IN_CALL
                     sessionId != null && sessionMode == SessionMode.ROUND_MANUAL -> LiveCaptureStatus.RECORDING_ROUND_MANUAL
                     sessionId != null && sessionMode == SessionMode.ROUND_AUTO -> LiveCaptureStatus.RECORDING_ROUND_AUTO
                     sessionId != null -> LiveCaptureStatus.RECORDING_AMBIENT
@@ -1701,7 +1701,7 @@ class CaptureEngine(private val context: Context) {
                                 isListeningEnabled = effectiveListening,
                                 currentSessionElapsedSec = elapsedSec,
                                 lastVadProbability = if (uiActive) prob else it.lastVadProbability,
-                                isInPhoneCall = callGuard.isInCallMode,
+                                isInPhoneCall = callGuard.isEffectivePhoneCall,
                                 isMicSilencedByOs = callGuard.isSilencedBySystem,
                                 isExternalMicActive = callGuard.externalRecordingActive,
                                 pauseReason = null,

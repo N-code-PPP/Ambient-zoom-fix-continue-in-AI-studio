@@ -27,9 +27,14 @@
     <queries>
         <package android:name="moe.shizuku.privileged.api" />
         <package android:name="us.zoom.videomeetings" />
+        <package android:name="us.zoom.videomeetings.m4i" />
         <package android:name="us.zoom.zrc" />
         <package android:name="com.cisco.wx2.android" />
         <package android:name="com.cisco.webex.meetings" />
+        <package android:name="com.cisco.wx2.android.intune" />
+        <package android:name="com.microsoft.teams" />
+        <package android:name="com.google.android.apps.tachyon" />
+        <package android:name="com.google.android.apps.meetings" />
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />

@@ -148,7 +148,8 @@ object AdbVirtualDisplayRunner {
         var looperThread: HandlerThread? = null
 
         var audioManager: AudioManager? = null
-        var speakerCaptureHandle: ShellAudioCaptureHandle? = null
+        val speakerCaptureHandleRef = AtomicReference<ShellAudioCaptureHandle?>(null)
+        val rebindAudioRequested = AtomicBoolean(false)
         var virtualMicHandle: ShellVirtualMicHandle? = null
         var aacWriter: ShellAdtsAacWriter? = null
         var audioCaptureThread: Thread? = null
@@ -271,7 +272,7 @@ object AdbVirtualDisplayRunner {
                 )
                 if (captureRes.first != null) {
                     val handle = captureRes.first!!
-                    speakerCaptureHandle = handle
+                    speakerCaptureHandleRef.set(handle)
                     val writer = ShellAdtsAacWriter(outAudioFile)
                     writer.start()
                     aacWriter = writer
@@ -279,7 +280,13 @@ object AdbVirtualDisplayRunner {
 
                     audioCaptureThread = Thread({
                         runIsolatedAudioLoop(
-                            handle = handle,
+                            shellContext = shellContext,
+                            audioManager = am,
+                            callbackLooper = callbackLooper,
+                            targetUid = targetUid,
+                            wantSilentSpeaker = wantSilentSpeaker,
+                            handleRef = speakerCaptureHandleRef,
+                            rebindRequested = rebindAudioRequested,
                             writer = writer,
                             running = running,
                             paused = paused,
@@ -390,6 +397,13 @@ object AdbVirtualDisplayRunner {
                             synchronized(previewWakeSignal) { previewWakeSignal.notifyAll() }
                         }
                     }
+                    upper == "REBIND_AUDIO" -> {
+                        if (speakerCaptureHandleRef.get() != null) {
+                            rebindAudioRequested.set(true)
+                        } else {
+                            emitLine("AUDIO_REBOUND:FAILED:No active isolated audio pipeline")
+                        }
+                    }
                     upper == "STOP" -> break
                 }
             }
@@ -399,8 +413,14 @@ object AdbVirtualDisplayRunner {
             synchronized(previewWakeSignal) { previewWakeSignal.notifyAll() }
 
             // Stop audio capture & virtual mic first so blocking reads/writes unblock cleanly
-            runCatching { speakerCaptureHandle?.audioRecord?.stop() }
-            runCatching { virtualMicHandle?.audioTrack?.stop() }
+            runCatching { speakerCaptureHandleRef.get()?.audioRecord?.stop() }
+            runCatching {
+                virtualMicHandle?.audioTrack?.let { tr ->
+                    tr.pause()
+                    tr.flush()
+                    tr.stop()
+                }
+            }
             runCatching { audioCaptureThread?.join(2_000L) }
             runCatching { virtualMicThread?.join(1_500L) }
             runCatching { previewThread?.join(1_000L) }
@@ -408,11 +428,11 @@ object AdbVirtualDisplayRunner {
             runCatching { aacWriter?.finishAndClose() }
             aacWriter = null
 
-            runCatching { speakerCaptureHandle?.audioRecord?.release() }
+            val finalSpeakerHandle = speakerCaptureHandleRef.getAndSet(null)
+            runCatching { finalSpeakerHandle?.audioRecord?.release() }
             runCatching { virtualMicHandle?.audioTrack?.release() }
-            unregisterAudioPolicySafe(am, speakerCaptureHandle?.audioPolicy)
+            unregisterAudioPolicySafe(am, finalSpeakerHandle?.audioPolicy)
             unregisterAudioPolicySafe(am, virtualMicHandle?.audioPolicy)
-            speakerCaptureHandle = null
             virtualMicHandle = null
 
             // Finish H.264 video stream cleanly
@@ -444,11 +464,12 @@ object AdbVirtualDisplayRunner {
             kotlin.system.exitProcess(0)
         } catch (t: Throwable) {
             running.set(false)
-            runCatching { speakerCaptureHandle?.audioRecord?.stop() }
-            runCatching { speakerCaptureHandle?.audioRecord?.release() }
+            val errSpeakerHandle = speakerCaptureHandleRef.getAndSet(null)
+            runCatching { errSpeakerHandle?.audioRecord?.stop() }
+            runCatching { errSpeakerHandle?.audioRecord?.release() }
             runCatching { virtualMicHandle?.audioTrack?.stop() }
             runCatching { virtualMicHandle?.audioTrack?.release() }
-            unregisterAudioPolicySafe(audioManager, speakerCaptureHandle?.audioPolicy)
+            unregisterAudioPolicySafe(audioManager, errSpeakerHandle?.audioPolicy)
             unregisterAudioPolicySafe(audioManager, virtualMicHandle?.audioPolicy)
             runCatching { aacWriter?.finishAndClose() }
             runCatching { virtualDisplay?.release() }
@@ -550,9 +571,10 @@ object AdbVirtualDisplayRunner {
             val addRuleMethod = ruleBuilderCls.getMethod("addRule", AudioAttributes::class.java, Int::class.javaPrimitiveType)
             val addMixRuleMethod = ruleBuilderCls.getMethod("addMixRule", Int::class.javaPrimitiveType, Any::class.java)
 
-            // Match VoIP voice communication + media + game + unknown + assistant
+            // Match VoIP voice communication + signalling + media + game + unknown + assistant
             val usages = intArrayOf(
                 AudioAttributes.USAGE_VOICE_COMMUNICATION,
+                AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING,
                 AudioAttributes.USAGE_MEDIA,
                 AudioAttributes.USAGE_GAME,
                 AudioAttributes.USAGE_UNKNOWN,
@@ -988,7 +1010,13 @@ object AdbVirtualDisplayRunner {
     }
 
     private fun runIsolatedAudioLoop(
-        handle: ShellAudioCaptureHandle,
+        shellContext: Context,
+        audioManager: AudioManager,
+        callbackLooper: Looper,
+        targetUid: Int,
+        wantSilentSpeaker: Boolean,
+        handleRef: AtomicReference<ShellAudioCaptureHandle?>,
+        rebindRequested: AtomicBoolean,
         writer: ShellAdtsAacWriter,
         running: AtomicBoolean,
         paused: AtomicBoolean,
@@ -997,40 +1025,205 @@ object AdbVirtualDisplayRunner {
         pausedAtAnchorMs: AtomicLong,
         sessionStartMonoMs: Long
     ) {
-        val decimationFactor = (handle.sampleRateHz / TARGET_AUDIO_RATE).coerceAtLeast(1)
-        val chCount = handle.channelCount.coerceIn(1, 2)
-        val readShortsCount = FRAME_SAMPLES_16K * decimationFactor * chCount
-        val rawBuf = ShortArray(readShortsCount)
+        var activeHandle = handleRef.get() ?: return
+        var decimationFactor = (activeHandle.sampleRateHz / TARGET_AUDIO_RATE).coerceAtLeast(1)
+        var chCount = activeHandle.channelCount.coerceIn(1, 2)
+        var unitShorts = decimationFactor * chCount
+        var readShortsCount = FRAME_SAMPLES_16K * unitShorts
+        var rawBuf = ShortArray(readShortsCount + unitShorts)
         val mono16k = ShortArray(FRAME_SAMPLES_16K)
         val silence16k = ShortArray(FRAME_SAMPLES_16K)
 
+        var rawCarryCount = 0
         var totalWrittenSamples16k = 0L
         var everDetectedSignal = false
         var lastLevelEmitMonoMs = 0L
+        var lastAudioDataMonoMs = sessionStartMonoMs
+        var useBlockingFallback = false
+        var consecutiveReadErrors = 0
+        var lastAutoRebindMonoMs = 0L
+
+        fun tryRebindAudioCapture(manual: Boolean): Boolean {
+            val nowMs = SystemClock.elapsedRealtime()
+            if (!manual && nowMs - lastAutoRebindMonoMs < 4_000L) {
+                return false
+            }
+            lastAutoRebindMonoMs = nowMs
+            val old = handleRef.getAndSet(null)
+            runCatching { old?.audioRecord?.stop() }
+            runCatching { old?.audioRecord?.release() }
+            unregisterAudioPolicySafe(audioManager, old?.audioPolicy)
+            runCatching { Thread.sleep(120L) }
+
+            val newRes = setupIsolatedAudioCapture(
+                shellContext = shellContext,
+                audioManager = audioManager,
+                callbackLooper = callbackLooper,
+                targetUid = targetUid,
+                silentSpeaker = wantSilentSpeaker
+            )
+            val fresh = newRes.first
+            return if (fresh != null) {
+                handleRef.set(fresh)
+                activeHandle = fresh
+                decimationFactor = (fresh.sampleRateHz / TARGET_AUDIO_RATE).coerceAtLeast(1)
+                chCount = fresh.channelCount.coerceIn(1, 2)
+                unitShorts = decimationFactor * chCount
+                readShortsCount = FRAME_SAMPLES_16K * unitShorts
+                rawBuf = ShortArray(readShortsCount + unitShorts)
+                rawCarryCount = 0
+                consecutiveReadErrors = 0
+                useBlockingFallback = false
+                runCatching { fresh.audioRecord.startRecording() }
+                emitLine("AUDIO_CAPTURE_TIER:${fresh.tierLabel}")
+                emitLine("AUDIO_SESSION_ID:${fresh.audioRecord.audioSessionId}")
+                emitLine("AUDIO_REBOUND:OK:${fresh.tierLabel}")
+                true
+            } else {
+                val reason = newRes.second ?: "AudioPolicy re-registration failed"
+                emitLine("AUDIO_REBOUND:FAILED:$reason")
+                false
+            }
+        }
+
+        fun resolveAnchorOrNull(nowMonoMs: Long): Long? {
+            var anchorMono = mediaTimelineAnchorMonoMs.get()
+            if (anchorMono == 0L) {
+                if (nowMonoMs - sessionStartMonoMs < AUDIO_ANCHOR_FALLBACK_WAIT_MS) {
+                    return null
+                }
+                if (mediaTimelineAnchorMonoMs.compareAndSet(0L, nowMonoMs)) {
+                    pausedAtAnchorMs.set(accumulatedPausedMs.get())
+                }
+                anchorMono = mediaTimelineAnchorMonoMs.get()
+            }
+            return anchorMono
+        }
+
+        fun padSilenceToWallClock(
+            nowMonoMs: Long,
+            anchorMono: Long,
+            upcomingSamples: Int,
+            maxPadSamples: Long,
+            idleCushionSamples: Long = 0L
+        ) {
+            val pausedSinceAnchorMs = (accumulatedPausedMs.get() - pausedAtAnchorMs.get()).coerceAtLeast(0L)
+            val activeElapsedMs = (nowMonoMs - anchorMono - pausedSinceAnchorMs).coerceAtLeast(0L)
+            val expectedSamples = ((activeElapsedMs * TARGET_AUDIO_RATE) / 1000L - idleCushionSamples).coerceAtLeast(0L)
+            val missingSamples = expectedSamples - totalWrittenSamples16k - upcomingSamples
+            // Bridge genuine stalls > 200ms during active audio; pad smoothly in 20ms frames during prolonged idle
+            val threshold = if (upcomingSamples == 0) FRAME_SAMPLES_16K.toLong() else 3_200L
+            if (missingSamples >= threshold) {
+                var padRemaining = minOf(missingSamples, maxPadSamples)
+                while (padRemaining >= FRAME_SAMPLES_16K && running.get() && !paused.get()) {
+                    writer.writePcmShorts(silence16k, 0, FRAME_SAMPLES_16K)
+                    totalWrittenSamples16k += FRAME_SAMPLES_16K
+                    padRemaining -= FRAME_SAMPLES_16K
+                }
+            }
+        }
 
         while (running.get()) {
-            val read = try {
-                handle.audioRecord.read(rawBuf, 0, readShortsCount, AudioRecord.READ_BLOCKING)
-            } catch (_: Throwable) {
-                break
-            }
-            if (read <= 0) {
-                if (!running.get()) break
-                runCatching { Thread.sleep(15L) }
+            if (rebindRequested.compareAndSet(true, false)) {
+                tryRebindAudioCapture(manual = true)
                 continue
             }
 
-            val nowMonoMs = SystemClock.elapsedRealtime()
-            if (paused.get()) {
-                if (nowMonoMs - lastLevelEmitMonoMs >= 200L) {
-                    lastLevelEmitMonoMs = nowMonoMs
-                    emitLine("AUDIO_LEVEL:0:${if (everDetectedSignal) 1 else 0}")
+            if (handleRef.get() == null) {
+                // Previous rebind failed; keep A/V timeline alive with silence and retry every 4s
+                val nowMonoMs = SystemClock.elapsedRealtime()
+                if (!paused.get() && nowMonoMs - lastAudioDataMonoMs >= 160L) {
+                    val anchorMono = resolveAnchorOrNull(nowMonoMs)
+                    if (anchorMono != null) {
+                        padSilenceToWallClock(
+                            nowMonoMs = nowMonoMs,
+                            anchorMono = anchorMono,
+                            upcomingSamples = 0,
+                            maxPadSamples = MAX_CATCHUP_PAD_SAMPLES_PER_READ.toLong(),
+                            idleCushionSamples = 1_280L
+                        )
+                    }
+                }
+                if (!tryRebindAudioCapture(manual = false)) {
+                    runCatching { Thread.sleep(100L) }
                 }
                 continue
             }
 
-            // Downmix & decimate to 16 kHz mono PCM
-            val outCount = convertToMono16k(rawBuf, read, chCount, decimationFactor, mono16k)
+            val maxToRead = (readShortsCount - rawCarryCount).coerceAtLeast(unitShorts)
+            val readMode = if (useBlockingFallback) AudioRecord.READ_BLOCKING else AudioRecord.READ_NON_BLOCKING
+            val read = try {
+                activeHandle.audioRecord.read(rawBuf, rawCarryCount, maxToRead, readMode)
+            } catch (_: Throwable) {
+                AudioRecord.ERROR_DEAD_OBJECT
+            }
+
+            if (read < 0) {
+                if (!useBlockingFallback && read == AudioRecord.ERROR_BAD_VALUE) {
+                    useBlockingFallback = true
+                    continue
+                }
+                if (!running.get()) break
+                consecutiveReadErrors++
+                if (read == AudioRecord.ERROR_DEAD_OBJECT || consecutiveReadErrors >= 15) {
+                    tryRebindAudioCapture(manual = false)
+                }
+                runCatching { Thread.sleep(20L) }
+                continue
+            }
+            consecutiveReadErrors = 0
+
+            val nowMonoMs = SystemClock.elapsedRealtime()
+            if (paused.get()) {
+                rawCarryCount = 0
+                lastAudioDataMonoMs = nowMonoMs
+                if (nowMonoMs - lastLevelEmitMonoMs >= 200L) {
+                    lastLevelEmitMonoMs = nowMonoMs
+                    emitLine("AUDIO_LEVEL:0:${if (everDetectedSignal) 1 else 0}")
+                }
+                if (read == 0) runCatching { Thread.sleep(20L) }
+                continue
+            }
+
+            if (read == 0) {
+                // Target app is silent (e.g., Zoom/Webex Waiting Room or muted) — wait 160ms of true
+                // silence before padding behind an 80ms jitter cushion so normal AudioFlinger burst
+                // jitter never injects clicks into live speech, while prolonged silence stays A/V locked.
+                if (nowMonoMs - lastLevelEmitMonoMs >= 200L) {
+                    lastLevelEmitMonoMs = nowMonoMs
+                    emitLine("AUDIO_LEVEL:0:${if (everDetectedSignal) 1 else 0}")
+                }
+                if (nowMonoMs - lastAudioDataMonoMs >= 160L) {
+                    val anchorMono = resolveAnchorOrNull(nowMonoMs)
+                    if (anchorMono != null) {
+                        padSilenceToWallClock(
+                            nowMonoMs = nowMonoMs,
+                            anchorMono = anchorMono,
+                            upcomingSamples = 0,
+                            maxPadSamples = MAX_CATCHUP_PAD_SAMPLES_PER_READ.toLong(),
+                            idleCushionSamples = 1_280L
+                        )
+                    }
+                }
+                runCatching { Thread.sleep(10L) }
+                continue
+            }
+
+            lastAudioDataMonoMs = nowMonoMs
+            val totalAvail = rawCarryCount + read
+            val usableShorts = (totalAvail / unitShorts) * unitShorts
+            if (usableShorts <= 0) {
+                rawCarryCount = totalAvail
+                continue
+            }
+
+            // Downmix & decimate complete sample groups to 16 kHz mono PCM
+            val outCount = convertToMono16k(rawBuf, usableShorts, chCount, decimationFactor, mono16k)
+            val leftover = totalAvail - usableShorts
+            if (leftover > 0) {
+                System.arraycopy(rawBuf, usableShorts, rawBuf, 0, leftover)
+            }
+            rawCarryCount = leftover
             if (outCount <= 0) continue
 
             val rms = computeRms(mono16k, outCount)
@@ -1045,31 +1238,14 @@ object AdbVirtualDisplayRunner {
 
             // Shared t=0 anchor: wait until first video frame latches (or fallback after 4s) so
             // both video and audio tracks start cleanly at PTS = 0 for universal player AV sync.
-            var anchorMono = mediaTimelineAnchorMonoMs.get()
-            if (anchorMono == 0L) {
-                if (nowMonoMs - sessionStartMonoMs < AUDIO_ANCHOR_FALLBACK_WAIT_MS) {
-                    continue
-                }
-                if (mediaTimelineAnchorMonoMs.compareAndSet(0L, nowMonoMs)) {
-                    pausedAtAnchorMs.set(accumulatedPausedMs.get())
-                }
-                anchorMono = mediaTimelineAnchorMonoMs.get()
-            }
+            val anchorMono = resolveAnchorOrNull(nowMonoMs) ?: continue
 
-            // Lip-sync pad using stdin-tracked accumulatedPausedMs (immune to PAUSE->RESUME while read() blocked)
-            // Capped to 500ms per read cycle so r_submix's fixed MonoPipe never overflows on long silent stalls.
-            val pausedSinceAnchorMs = (accumulatedPausedMs.get() - pausedAtAnchorMs.get()).coerceAtLeast(0L)
-            val activeElapsedMs = (nowMonoMs - anchorMono - pausedSinceAnchorMs).coerceAtLeast(0L)
-            val expectedSamples = (activeElapsedMs * TARGET_AUDIO_RATE) / 1000L
-            val missingSamples = expectedSamples - totalWrittenSamples16k - outCount
-            if (missingSamples > 4_000L) { // > 250 ms drift
-                var padRemaining = minOf(missingSamples, MAX_CATCHUP_PAD_SAMPLES_PER_READ.toLong())
-                while (padRemaining >= FRAME_SAMPLES_16K && running.get() && !paused.get()) {
-                    writer.writePcmShorts(silence16k, 0, FRAME_SAMPLES_16K)
-                    totalWrittenSamples16k += FRAME_SAMPLES_16K
-                    padRemaining -= FRAME_SAMPLES_16K
-                }
-            }
+            padSilenceToWallClock(
+                nowMonoMs = nowMonoMs,
+                anchorMono = anchorMono,
+                upcomingSamples = outCount,
+                maxPadSamples = MAX_CATCHUP_PAD_SAMPLES_PER_READ.toLong()
+            )
 
             writer.writePcmShorts(mono16k, 0, outCount)
             totalWrittenSamples16k += outCount
@@ -1446,7 +1622,7 @@ object AdbVirtualDisplayRunner {
                 lastPreviewDir = outFile.parentFile
                 lastPreviewBaseName = outFile.name
                 val ptsUs = (++previewFrameCounter) * 33_333L
-                val ok = decodeKeyframeToJpeg(activeDec, snap.bytes, ptsUs, outFile)
+                val ok = decodeKeyframeToJpeg(activeDec, srcFmt, snap.bytes, ptsUs, outFile)
                 if (ok) {
                     lastDecodedSeq = snap.seq
                     emitLine("PREVIEW_FRAME:${System.currentTimeMillis()}")
@@ -1503,20 +1679,60 @@ object AdbVirtualDisplayRunner {
         return ByteBuffer.wrap(arr)
     }
 
+    private fun prependCodecConfigIfNeeded(srcFmt: MediaFormat, idrBytes: ByteArray): ByteArray {
+        // Check if IDR frame already starts with SPS NAL unit (type 7)
+        val hasLeadingSps = (idrBytes.size >= 5 &&
+            idrBytes[0] == 0.toByte() && idrBytes[1] == 0.toByte() &&
+            idrBytes[2] == 0.toByte() && idrBytes[3] == 1.toByte() &&
+            (idrBytes[4].toInt() and 0x1F) == 7) ||
+            (idrBytes.size >= 4 &&
+                idrBytes[0] == 0.toByte() && idrBytes[1] == 0.toByte() &&
+                idrBytes[2] == 1.toByte() && (idrBytes[3].toInt() and 0x1F) == 7)
+        if (hasLeadingSps) return idrBytes
+
+        val csd0 = srcFmt.getByteBuffer("csd-0")?.let { buf ->
+            val dup = buf.duplicate()
+            dup.rewind()
+            ByteArray(dup.remaining()).also { dup.get(it) }
+        }
+        val csd1 = srcFmt.getByteBuffer("csd-1")?.let { buf ->
+            val dup = buf.duplicate()
+            dup.rewind()
+            ByteArray(dup.remaining()).also { dup.get(it) }
+        }
+        val extraLen = (csd0?.size ?: 0) + (csd1?.size ?: 0)
+        if (extraLen <= 0) return idrBytes
+
+        val combined = ByteArray(extraLen + idrBytes.size)
+        var pos = 0
+        if (csd0 != null && csd0.isNotEmpty()) {
+            System.arraycopy(csd0, 0, combined, pos, csd0.size)
+            pos += csd0.size
+        }
+        if (csd1 != null && csd1.isNotEmpty()) {
+            System.arraycopy(csd1, 0, combined, pos, csd1.size)
+            pos += csd1.size
+        }
+        System.arraycopy(idrBytes, 0, combined, pos, idrBytes.size)
+        return combined
+    }
+
     private fun decodeKeyframeToJpeg(
         decoder: MediaCodec,
+        srcFmt: MediaFormat,
         idrBytes: ByteArray,
         ptsUs: Long,
         outFile: File
     ): Boolean {
         return try {
+            val payload = prependCodecConfigIfNeeded(srcFmt, idrBytes)
             val inIdx = decoder.dequeueInputBuffer(30_000L)
             if (inIdx < 0) return false
             val inBuf = decoder.getInputBuffer(inIdx) ?: return false
             inBuf.clear()
-            if (inBuf.capacity() < idrBytes.size) return false
-            inBuf.put(idrBytes)
-            decoder.queueInputBuffer(inIdx, 0, idrBytes.size, ptsUs, MediaCodec.BUFFER_FLAG_KEY_FRAME)
+            if (inBuf.capacity() < payload.size) return false
+            inBuf.put(payload)
+            decoder.queueInputBuffer(inIdx, 0, payload.size, ptsUs, MediaCodec.BUFFER_FLAG_KEY_FRAME)
 
             // Queue EOS to force hardware decoders with 1-frame reorder queues to emit immediately,
             // then drain through EOS cleanly before calling flush().

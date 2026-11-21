@@ -10,12 +10,23 @@ android {
     namespace = "com.ambientbrain.recorder"
     compileSdk = 35
 
+    val baseVersionCode = 19
+    val baseVersionName = "1.1.9"
+    val resolvedVersionCode = (project.findProperty("appVersionCode") as String?)
+        ?.trim()
+        ?.toIntOrNull()
+        ?: baseVersionCode
+    val resolvedVersionName = (project.findProperty("appVersionName") as String?)
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?: baseVersionName
+
     defaultConfig {
-        applicationId = "test.ambient.app"
+        applicationId = "com.ambientbrain.recorder"
         minSdk = 34
         targetSdk = 35
-        versionCode = 18
-        versionName = "1.1.8"
+        versionCode = resolvedVersionCode
+        versionName = resolvedVersionName
 
         vectorDrawables {
             useSupportLibrary = true

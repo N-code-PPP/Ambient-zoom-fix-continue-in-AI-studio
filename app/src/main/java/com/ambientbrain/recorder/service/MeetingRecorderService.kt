@@ -27,6 +27,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.os.Process
+import android.os.StatFs
 import android.os.SystemClock
 import android.util.Log
 import android.widget.Toast
@@ -74,12 +75,12 @@ enum class MeetingPlatform(
     ZOOM(
         label = "Zoom",
         shortLabel = "Zoom",
-        packageCandidates = listOf("us.zoom.videomeetings", "us.zoom.zrc")
+        packageCandidates = listOf("us.zoom.videomeetings", "us.zoom.videomeetings.m4i", "us.zoom.zrc")
     ),
     WEBEX(
         label = "Webex",
         shortLabel = "Webex",
-        packageCandidates = listOf("com.cisco.wx2.android", "com.cisco.webex.meetings")
+        packageCandidates = listOf("com.cisco.wx2.android", "com.cisco.webex.meetings", "com.cisco.wx2.android.intune")
     ),
     OTHER_APP(
         label = "Other App",
@@ -91,8 +92,13 @@ enum class MeetingPlatform(
         shortLabel = "Meeting",
         packageCandidates = listOf(
             "us.zoom.videomeetings",
+            "us.zoom.videomeetings.m4i",
             "com.cisco.wx2.android",
             "com.cisco.webex.meetings",
+            "com.cisco.wx2.android.intune",
+            "com.microsoft.teams",
+            "com.google.android.apps.tachyon",
+            "com.google.android.apps.meetings",
             "us.zoom.zrc"
         )
     )
@@ -154,6 +160,7 @@ data class MeetingRecorderState(
     val enableVirtualMic: Boolean = true,
     val silentSpeakerIsolation: Boolean = true,
     val keepAmbientBrainListening: Boolean = true,
+    val landscapeVirtualScreen: Boolean = false,
     val elapsedSec: Long = 0L,
     val recordedBytes: Long = 0L,
     val internalLevelNorm: Float = 0f,
@@ -161,6 +168,9 @@ data class MeetingRecorderState(
     val internalAudioDetected: Boolean = false,
     val internalSilenceHint: Boolean = false,
     val micSilencedByOs: Boolean = false,
+    val bluetoothScoActive: Boolean = false,
+    val lowStorageWarning: String? = null,
+    val targetAppOnVirtualDisplay: Boolean? = null,
     val speakerphoneBoostEnabled: Boolean = false,
     val activeMicSourceLabel: String = "",
     val internalSampleRateHz: Int = 0,
@@ -260,6 +270,12 @@ class MeetingRecorderService : Service() {
     private val lastInternalRmsScaled = AtomicLong(0L)
     private val lastMicRmsScaled = AtomicLong(0L)
 
+    // Shared A/V sync clock for standard MediaProjection video + audio pipeline
+    private val standardTimelineAnchorMonoMs = AtomicLong(0L)
+    private val standardPauseStartMonoMs = AtomicLong(-1L)
+    private val standardAccumulatedPausedMs = AtomicLong(0L)
+    private val standardPausedAtAnchorMs = AtomicLong(0L)
+
     @Volatile
     private var stealthVuNorm: Float = 0f
 
@@ -277,6 +293,9 @@ class MeetingRecorderService : Service() {
 
     @Volatile
     private var recordingCallback: AudioManager.AudioRecordingCallback? = null
+
+    @Volatile
+    private var commDeviceListener: AudioManager.OnCommunicationDeviceChangedListener? = null
 
     @Volatile
     private var wakeLock: PowerManager.WakeLock? = null
@@ -322,6 +341,7 @@ class MeetingRecorderService : Service() {
     private var activeSilentSpeaker: Boolean = true
     private var activeKeepAmbientListening: Boolean = true
     private var activeShowMiniPreviewOnStart: Boolean = false
+    private var activeLandscapeVirtualScreen: Boolean = false
 
     private var activeOutputFile: File? = null
     private var activeMicOnlyFile: File? = null
@@ -353,6 +373,7 @@ class MeetingRecorderService : Service() {
             ACTION_MOVE_APP_TO_VIRTUAL -> handleMoveAppDisplay(toVirtual = true)
             ACTION_BRING_APP_TO_MAIN -> handleMoveAppDisplay(toVirtual = false)
             ACTION_TOGGLE_MINI_PREVIEW -> handleToggleMiniPreview()
+            ACTION_REBIND_STEALTH_AUDIO -> handleRebindStealthAudio()
             else -> {
                 if (!isRunning.get() && !isFinalizing.get()) {
                     stopSelf()
@@ -410,6 +431,10 @@ class MeetingRecorderService : Service() {
         val silentSpeaker = intent.getBooleanExtra(EXTRA_SILENT_SPEAKER, true)
         val keepAmbientListening = intent.getBooleanExtra(EXTRA_KEEP_AMBIENT_LISTENING, true)
         val showMiniPreviewOnStart = intent.getBooleanExtra(EXTRA_SHOW_MINI_PREVIEW, false)
+        val landscapeVirtualScreen = intent.getBooleanExtra(
+            EXTRA_LANDSCAPE_VIRTUAL_SCREEN,
+            PreferencesRepo(applicationContext).meetingVirtualScreenLandscape
+        )
         val initialSpeakerphone = intent.getBooleanExtra(
             EXTRA_SPEAKERPHONE_BOOST,
             captureMode == MeetingAudioCaptureMode.MIC_SPEAKERPHONE
@@ -444,6 +469,19 @@ class MeetingRecorderService : Service() {
             return
         }
 
+        // Pre-start low-storage guard so a meeting never fails mid-mux with ENOSPC
+        val preStartAvailMb = queryAvailableStorageMb(includeExternalCache = captureMode.usesAdbStealthAudio || videoMode == MeetingVideoMode.ADB_VIRTUAL_SCREEN)
+        if (preStartAvailMb in 0L until MIN_START_STORAGE_MB) {
+            emitStartError("Low device storage (${preStartAvailMb} MB free). Free up at least ${MIN_START_STORAGE_MB} MB before recording a meeting.")
+            stopSelf()
+            return
+        }
+        val initialLowStorageWarning = if (preStartAvailMb in MIN_START_STORAGE_MB until WARN_STORAGE_MB) {
+            "Low storage (${preStartAvailMb} MB free). Recording will auto-save cleanly if space drops below ${CRITICAL_STOP_STORAGE_MB} MB."
+        } else {
+            null
+        }
+
         ensureNotificationChannel()
 
         val fgsType = when {
@@ -472,6 +510,7 @@ class MeetingRecorderService : Service() {
         activeSilentSpeaker = silentSpeaker
         activeKeepAmbientListening = keepAmbientListening
         activeShowMiniPreviewOnStart = showMiniPreviewOnStart
+        activeLandscapeVirtualScreen = landscapeVirtualScreen
         activeOutputFile = null
         activeMicOnlyFile = null
         activeTempVideoFile = null
@@ -490,6 +529,10 @@ class MeetingRecorderService : Service() {
         micSilencedFlag.set(false)
         lastInternalRmsScaled.set(0L)
         lastMicRmsScaled.set(0L)
+        standardTimelineAnchorMonoMs.set(0L)
+        standardPauseStartMonoMs.set(-1L)
+        standardAccumulatedPausedMs.set(0L)
+        standardPausedAtAnchorMs.set(0L)
         isPaused.set(false)
         isFinalizing.set(false)
         segmentMaps.clear()
@@ -544,6 +587,7 @@ class MeetingRecorderService : Service() {
         }
 
         isRunning.set(true)
+        val initialBtActive = isBluetoothCommunicationRouteActive()
         MeetingRecorderStateBus.update {
             MeetingRecorderState(
                 isRecording = true,
@@ -562,6 +606,10 @@ class MeetingRecorderService : Service() {
                 enableVirtualMic = enableVirtualMic,
                 silentSpeakerIsolation = silentSpeaker,
                 keepAmbientBrainListening = keepAmbientListening,
+                landscapeVirtualScreen = landscapeVirtualScreen,
+                bluetoothScoActive = initialBtActive,
+                lowStorageWarning = initialLowStorageWarning,
+                targetAppOnVirtualDisplay = null,
                 speakerphoneBoostEnabled = false,
                 videoActive = false,
                 virtualDisplayId = null,
@@ -575,8 +623,16 @@ class MeetingRecorderService : Service() {
                 lastError = null
             )
         }
+        registerBluetoothRouteMonitor()
 
         serviceScope.launch {
+            // Recover any prior meeting recording left behind by an unexpected OS kill before starting fresh
+            runCatching {
+                MeetingRecoveryManager.recoverUnfinishedSessionIfAny(
+                    context = applicationContext,
+                    allowWhileStarting = true
+                )
+            }
             if (captureMode.usesAdbStealthAudio) {
                 startStealthAdbIsolationPipeline()
             } else {
@@ -633,11 +689,18 @@ class MeetingRecorderService : Service() {
                 return
             }
 
-            val (w, h, dpi) = MediaProjectionVideoRecorder.computeRecordingDimensions(applicationContext, 720)
+            val (w, h, dpi) = MediaProjectionVideoRecorder.computeRecordingDimensions(
+                context = applicationContext,
+                targetShortEdgePx = 720,
+                landscape = activeLandscapeVirtualScreen
+            )
             val tempVideo = File(sharedTempDir, "vdisp_${activeSessionId}.mp4")
             val tempAudio = File(sharedTempDir, "vdisp_audio_${activeSessionId}.aac")
             activeTempVideoFile = tempVideo
             activeTempStealthAudioFile = tempAudio
+
+            // Persist synchronous crash-recovery checkpoint before launching runner
+            saveActiveRecoveryCheckpoint()
 
             val result = AdbVirtualScreenController.startVirtualScreen(
                 context = applicationContext,
@@ -657,6 +720,36 @@ class MeetingRecorderService : Service() {
                 },
                 onPreviewFrame = {
                     miniPreviewOverlay?.onPreviewFrameAvailable()
+                },
+                onAudioSessionUpdated = { newTier, newSid ->
+                    activeAudioCaptureTier = newTier
+                    MeetingRecorderStateBus.update { st ->
+                        if (!st.isRecording) st else st.copy(
+                            audioCaptureTier = newTier,
+                            stealthAudioSessionId = newSid
+                        )
+                    }
+                },
+                onAudioRebound = { ok, detail ->
+                    Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(
+                            applicationContext,
+                            if (ok) "Re-synced isolated audio ($detail)" else "Audio re-sync failed: $detail",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                },
+                onProcessExited = { exitCode, errText ->
+                    if (isRunning.get() && !isFinalizing.get()) {
+                        val reasonMsg = errText?.take(140) ?: "exit code $exitCode"
+                        Log.e(TAG, "Stealth ADB runner died unexpectedly ($reasonMsg) — finalizing captured media")
+                        MeetingRecorderStateBus.update { st ->
+                            st.copy(
+                                lastError = "Stealth ADB runner stopped unexpectedly ($reasonMsg). Saving captured media & restoring mic..."
+                            )
+                        }
+                        requestStopAndFinalize("Stealth ADB runner exited unexpectedly ($reasonMsg)")
+                    }
                 }
             )
 
@@ -727,13 +820,15 @@ class MeetingRecorderService : Service() {
             }
             val combinedWarning = warningMessages.joinToString(" ").takeIf { it.isNotBlank() }
 
+            val orientTag = if (activeLandscapeVirtualScreen) "16:9" else "Portrait"
             MeetingRecorderStateBus.update {
                 it.copy(
                     videoActive = true,
                     virtualDisplayId = vSession.displayId,
                     virtualDisplayWidth = w,
                     virtualDisplayHeight = h,
-                    videoStatusNote = "Virtual Display #${vSession.displayId} (${w}×${h})$movedNote",
+                    targetAppOnVirtualDisplay = moved,
+                    videoStatusNote = "Virtual Display #${vSession.displayId} ($orientTag ${w}×${h})$movedNote",
                     audioCaptureTier = activeAudioCaptureTier,
                     virtualMicTier = activeVirtualMicTier,
                     stealthAudioSessionId = vSession.audioSessionId,
@@ -746,12 +841,21 @@ class MeetingRecorderService : Service() {
                 openMiniPreviewOverlay(vSession)
             }
 
-            // Live timer & VU UI ticker for Stealth mode
+            // Live timer, process watchdog, task-pin check, storage guard & VU UI ticker for Stealth mode
             stealthTickerJob = serviceScope.launch {
                 var lastTickMono = SystemClock.elapsedRealtime()
                 var notifTicks = 0
+                var watchdogTicks = 0
                 while (isActive && isRunning.get()) {
                     delay(200L)
+                    if (!vSession.process.isAlive && isRunning.get() && !isFinalizing.get()) {
+                        Log.e(TAG, "Stealth runner watchdog detected dead process — triggering safe finalize")
+                        MeetingRecorderStateBus.update { st ->
+                            st.copy(lastError = "Stealth ADB runner disconnected unexpectedly. Saving captured media & restoring mic...")
+                        }
+                        requestStopAndFinalize("Stealth runner watchdog detected process exit")
+                        break
+                    }
                     val nowMono = SystemClock.elapsedRealtime()
                     val pausedNow = isPaused.get()
                     if (!pausedNow) {
@@ -762,6 +866,10 @@ class MeetingRecorderService : Service() {
                     val elapsedSec = stealthActiveElapsedMs / 1000L
                     val totalBytes = (activeTempVideoFile?.length() ?: 0L) + (activeTempStealthAudioFile?.length() ?: 0L)
                     val detected = internalAudioEverDetected.get()
+                    val stealthSilenceHint = !activeAudioCaptureTier.startsWith("FAILED:") &&
+                        !detected &&
+                        !pausedNow &&
+                        elapsedSec >= STEALTH_SILENCE_HINT_SEC
 
                     miniPreviewOverlay?.updateElapsedText(formatDuration(elapsedSec))
 
@@ -773,13 +881,30 @@ class MeetingRecorderService : Service() {
                             internalLevelNorm = if (pausedNow) 0f else stealthVuNorm,
                             micLevelNorm = 0f,
                             internalAudioDetected = detected,
-                            internalSilenceHint = false
+                            internalSilenceHint = stealthSilenceHint
                         )
                     }
 
                     if (++notifTicks >= 5) {
                         notifTicks = 0
                         updateOngoingNotification()
+                    }
+
+                    // Every ~10 seconds: verify storage headroom + whether target app stayed on Virtual Display
+                    if (++watchdogTicks >= 50) {
+                        watchdogTicks = 0
+                        if (checkLiveStorageSafety(includeExternalCache = true)) {
+                            break
+                        }
+                        val curDisplay = runCatching {
+                            AdbVirtualScreenController.getActiveTaskDisplayId(targetPkg)
+                        }.getOrNull()
+                        if (curDisplay != null) {
+                            val pinnedOnVirtual = curDisplay == vSession.displayId
+                            MeetingRecorderStateBus.update { st ->
+                                if (!st.isRecording) st else st.copy(targetAppOnVirtualDisplay = pinnedOnVirtual)
+                            }
+                        }
                     }
                 }
             }
@@ -854,6 +979,7 @@ class MeetingRecorderService : Service() {
             }
 
             startStandardVideoPipelineIfRequested()
+            saveActiveRecoveryCheckpoint()
 
             MeetingRecorderStateBus.update {
                 it.copy(
@@ -920,7 +1046,11 @@ class MeetingRecorderService : Service() {
                     val recorder = MediaProjectionVideoRecorder(
                         context = applicationContext,
                         mediaProjection = projection,
-                        outputVideoFile = tempVideo
+                        outputVideoFile = tempVideo,
+                        mediaTimelineAnchorMonoMs = standardTimelineAnchorMonoMs,
+                        accumulatedPausedMs = standardAccumulatedPausedMs,
+                        pausedAtAnchorMs = standardPausedAtAnchorMs,
+                        usesExternalPauseClock = true
                     )
                     recorder.start()
                     mediaProjectionVideoRecorder = recorder
@@ -955,7 +1085,20 @@ class MeetingRecorderService : Service() {
                     }
                     return
                 }
-                val (w, h, dpi) = MediaProjectionVideoRecorder.computeRecordingDimensions(applicationContext, 720)
+                // Resolve actually-running Zoom/Webex/Teams app when AUTO mode is paired with ADB Virtual Screen
+                if (activePlatform == MeetingPlatform.AUTO) {
+                    val runningPkg = AdbVirtualScreenController.findRunningCandidatePackage(MeetingPlatform.AUTO.packageCandidates)
+                    if (!runningPkg.isNullOrBlank()) {
+                        activeTargetPackageName = runningPkg
+                        activeTargetAppLabel = InstalledAppQueryHelper.resolveAppLabel(applicationContext, runningPkg)
+                            .ifBlank { activeTargetAppLabel }
+                    }
+                }
+                val (w, h, dpi) = MediaProjectionVideoRecorder.computeRecordingDimensions(
+                    context = applicationContext,
+                    targetShortEdgePx = 720,
+                    landscape = activeLandscapeVirtualScreen
+                )
                 val tempVideo = File(sharedTempDir, "vdisp_${activeSessionId}.mp4")
                 activeTempVideoFile = tempVideo
 
@@ -970,6 +1113,22 @@ class MeetingRecorderService : Service() {
                     fps = 15,
                     onPreviewFrame = {
                         miniPreviewOverlay?.onPreviewFrameAvailable()
+                    },
+                    onProcessExited = { exitCode, errText ->
+                        if (isRunning.get() && !isFinalizing.get()) {
+                            val reason = errText?.take(120) ?: "exit $exitCode"
+                            Log.w(TAG, "Non-stealth ADB Virtual Screen exited unexpectedly ($reason); audio continues")
+                            dismissMiniPreviewOverlay()
+                            MeetingRecorderStateBus.update { st ->
+                                if (!st.isRecording) st else st.copy(
+                                    videoActive = false,
+                                    virtualDisplayId = null,
+                                    targetAppOnVirtualDisplay = null,
+                                    videoStatusNote = "Virtual Screen exited unexpectedly (audio continues)",
+                                    lastError = "ADB Virtual Screen disconnected ($reason). Audio continues recording."
+                                )
+                            }
+                        }
                     }
                 )
 
@@ -977,9 +1136,10 @@ class MeetingRecorderService : Service() {
                 if (vSession != null) {
                     adbVirtualScreenSession = vSession
                     val targetPkg = activeTargetPackageName
+                    var moved = false
                     var movedNote = ""
                     if (!targetPkg.isNullOrBlank()) {
-                        val moved = AdbVirtualScreenController.moveAppToDisplay(
+                        moved = AdbVirtualScreenController.moveAppToDisplay(
                             context = applicationContext,
                             packageName = targetPkg,
                             displayId = vSession.displayId
@@ -990,13 +1150,17 @@ class MeetingRecorderService : Service() {
                             " • Tap 'Send to Virtual' if needed"
                         }
                     }
+                    val orientTag = if (activeLandscapeVirtualScreen) "16:9" else "Portrait"
                     MeetingRecorderStateBus.update {
                         it.copy(
+                            targetPackageName = activeTargetPackageName.orEmpty(),
+                            targetAppLabel = activeTargetAppLabel,
                             videoActive = true,
                             virtualDisplayId = vSession.displayId,
                             virtualDisplayWidth = w,
                             virtualDisplayHeight = h,
-                            videoStatusNote = "ADB Virtual Display #${vSession.displayId} (${w}×${h})$movedNote"
+                            targetAppOnVirtualDisplay = if (!targetPkg.isNullOrBlank()) moved else null,
+                            videoStatusNote = "ADB Virtual Display #${vSession.displayId} ($orientTag ${w}×${h})$movedNote"
                         )
                     }
                     if (activeShowMiniPreviewOnStart) {
@@ -1049,6 +1213,11 @@ class MeetingRecorderService : Service() {
             }
             MeetingRecorderStateBus.update { st ->
                 if (!st.isRecording) st else st.copy(
+                    targetAppOnVirtualDisplay = when {
+                        toVirtual && ok -> true
+                        !toVirtual && ok -> false
+                        else -> st.targetAppOnVirtualDisplay
+                    },
                     videoStatusNote = if (toVirtual) {
                         if (ok) {
                             "Virtual Display #${vSession.displayId} • $activeTargetAppLabel running in background"
@@ -1064,6 +1233,14 @@ class MeetingRecorderService : Service() {
                     }
                 )
             }
+        }
+    }
+
+    private fun handleRebindStealthAudio() {
+        val vSession = adbVirtualScreenSession ?: return
+        if (!isRunning.get() || isFinalizing.get() || !activeCaptureMode.usesAdbStealthAudio) return
+        serviceScope.launch {
+            AdbVirtualScreenController.sendCommand(vSession, "REBIND_AUDIO")
         }
     }
 
@@ -1235,23 +1412,54 @@ class MeetingRecorderService : Service() {
         }
     }
 
-    private fun runInternalReaderLoop(rec: AudioRecord, rateHz: Int) {
+    @SuppressLint("MissingPermission")
+    private fun runInternalReaderLoop(initialRec: AudioRecord, initialRateHz: Int) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
-        val decimationFactor = (rateHz / TARGET_SAMPLE_RATE).coerceAtLeast(1)
-        val readSize = FRAME_SAMPLES * decimationFactor
-        val rawBuf = ShortArray(readSize)
+        var rec = initialRec
+        var rateHz = initialRateHz
+        var decimationFactor = (rateHz / TARGET_SAMPLE_RATE).coerceAtLeast(1)
+        var readSize = FRAME_SAMPLES * decimationFactor
+        var rawBuf = ShortArray(readSize)
+        var consecutiveErrors = 0
+        var recoveryAttempts = 0
 
         while (isRunning.get()) {
             val read = try {
                 rec.read(rawBuf, 0, readSize, AudioRecord.READ_BLOCKING)
             } catch (_: Throwable) {
-                break
+                AudioRecord.ERROR_DEAD_OBJECT
             }
             if (read <= 0) {
                 if (!isRunning.get()) break
-                runCatching { Thread.sleep(10L) }
+                if (read < 0) {
+                    consecutiveErrors++
+                    if ((read == AudioRecord.ERROR_DEAD_OBJECT || consecutiveErrors >= 25) && recoveryAttempts < 3) {
+                        val proj = mediaProjection
+                        if (proj != null) {
+                            recoveryAttempts++
+                            Log.w(TAG, "Internal AudioRecord error ($read) — attempting recovery #$recoveryAttempts")
+                            runCatching { rec.stop() }
+                            runCatching { rec.release() }
+                            runCatching { Thread.sleep(250L) }
+                            val reopened = runCatching { createInternalPlaybackAudioRecord(proj) }.getOrNull()
+                            if (reopened != null) {
+                                rec = reopened.first
+                                rateHz = reopened.second
+                                internalAudioRecord = rec
+                                decimationFactor = (rateHz / TARGET_SAMPLE_RATE).coerceAtLeast(1)
+                                readSize = FRAME_SAMPLES * decimationFactor
+                                rawBuf = ShortArray(readSize)
+                                consecutiveErrors = 0
+                                runCatching { rec.startRecording() }
+                                continue
+                            }
+                        }
+                    }
+                }
+                runCatching { Thread.sleep(15L) }
                 continue
             }
+            consecutiveErrors = 0
 
             val frame16k = if (decimationFactor == 1) {
                 ShortArray(FRAME_SAMPLES).also { out ->
@@ -1295,21 +1503,52 @@ class MeetingRecorderService : Service() {
         return out
     }
 
-    private fun runMicReaderLoop(rec: AudioRecord) {
+    @SuppressLint("MissingPermission")
+    private fun runMicReaderLoop(initialRec: AudioRecord) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+        var rec = initialRec
         val readBuf = ShortArray(FRAME_SAMPLES)
+        var consecutiveErrors = 0
+        var recoveryAttempts = 0
 
         while (isRunning.get()) {
             val read = try {
                 rec.read(readBuf, 0, FRAME_SAMPLES, AudioRecord.READ_BLOCKING)
             } catch (_: Throwable) {
-                break
+                AudioRecord.ERROR_DEAD_OBJECT
             }
             if (read <= 0) {
                 if (!isRunning.get()) break
-                runCatching { Thread.sleep(10L) }
+                if (read < 0) {
+                    consecutiveErrors++
+                    if ((read == AudioRecord.ERROR_DEAD_OBJECT || consecutiveErrors >= 25) && recoveryAttempts < 3) {
+                        recoveryAttempts++
+                        Log.w(TAG, "Mic AudioRecord error ($read) — attempting recovery #$recoveryAttempts")
+                        runCatching { rec.stop() }
+                        runCatching { rec.release() }
+                        runCatching { Thread.sleep(250L) }
+                        val reopened = runCatching { createMicrophoneAudioRecord() }.getOrNull()
+                        if (reopened != null) {
+                            rec = reopened.first
+                            micAudioRecord = rec
+                            consecutiveErrors = 0
+                            runCatching { rec.startRecording() }
+                            runCatching {
+                                val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                                recordingCallback?.let { cb -> am?.unregisterAudioRecordingCallback(cb) }
+                                registerMicSilencedMonitor(rec.audioSessionId)
+                            }
+                            MeetingRecorderStateBus.update { st ->
+                                if (!st.isRecording) st else st.copy(activeMicSourceLabel = reopened.second)
+                            }
+                            continue
+                        }
+                    }
+                }
+                runCatching { Thread.sleep(15L) }
                 continue
             }
+            consecutiveErrors = 0
 
             val frame = ShortArray(FRAME_SAMPLES)
             System.arraycopy(readBuf, 0, frame, 0, minOf(read, FRAME_SAMPLES))
@@ -1366,10 +1605,17 @@ class MeetingRecorderService : Service() {
             if (pausedNow) {
                 closeOpenSegmentIfNeeded()
                 internalQueue.clear()
-                if (!hasMicClock) micQueue.clear()
+                micQueue.clear()
                 smoothedInternalVu *= 0.6f
                 smoothedMicVu *= 0.6f
             } else {
+                // Anchor shared t=0 timeline on first active audio frame so MediaProjection video stays in lip-sync
+                if (standardTimelineAnchorMonoMs.get() == 0L) {
+                    val nowMono = SystemClock.elapsedRealtime()
+                    if (standardTimelineAnchorMonoMs.compareAndSet(0L, nowMono)) {
+                        standardPausedAtAnchorMs.set(standardAccumulatedPausedMs.get())
+                    }
+                }
                 if (currentSegmentStartOffsetMs < 0L) {
                     currentSegmentStartOffsetMs = (totalWrittenSamples * 1000L) / TARGET_SAMPLE_RATE
                     currentSegmentWallMs = System.currentTimeMillis()
@@ -1432,6 +1678,11 @@ class MeetingRecorderService : Service() {
             if (notifTickCounter >= 50) {
                 notifTickCounter = 0
                 updateOngoingNotification()
+                if (activeElapsedFrames % 500L < 50L) {
+                    if (checkLiveStorageSafety(includeExternalCache = activeVideoMode == MeetingVideoMode.ADB_VIRTUAL_SCREEN)) {
+                        break
+                    }
+                }
             }
         }
     }
@@ -1494,6 +1745,14 @@ class MeetingRecorderService : Service() {
         if (!isRunning.get() || isFinalizing.get()) return
         val newPaused = !isPaused.get()
         isPaused.set(newPaused)
+        if (newPaused) {
+            standardPauseStartMonoMs.set(SystemClock.elapsedRealtime())
+        } else {
+            val startedAt = standardPauseStartMonoMs.getAndSet(-1L)
+            if (startedAt > 0L) {
+                standardAccumulatedPausedMs.addAndGet((SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L))
+            }
+        }
         mediaProjectionVideoRecorder?.setPaused(newPaused)
         adbVirtualScreenSession?.let { vSession ->
             serviceScope.launch {
@@ -1584,7 +1843,7 @@ class MeetingRecorderService : Service() {
                 if (vSession != null) {
                     val targetPkg = activeTargetPackageName
                     if (!targetPkg.isNullOrBlank()) {
-                        runCatching {
+                        val movedBack = runCatching {
                             // Only move back if still running; never relaunch a closed app onto Display 0 on Stop
                             AdbVirtualScreenController.moveAppToDisplay(
                                 context = applicationContext,
@@ -1592,6 +1851,10 @@ class MeetingRecorderService : Service() {
                                 displayId = 0,
                                 launchIfNotRunning = false
                             )
+                        }.getOrDefault(false)
+                        if (movedBack) {
+                            // Allow WindowManager to finish reparenting the active call task before releasing VirtualDisplay
+                            delay(300L)
                         }
                     }
                     val (vOk, aOk) = AdbVirtualScreenController.stopAndFinalize(vSession)
@@ -1811,6 +2074,7 @@ class MeetingRecorderService : Service() {
                             enableVirtualMic = activeEnableVirtualMic,
                             silentSpeakerIsolation = activeSilentSpeaker,
                             keepAmbientBrainListening = activeKeepAmbientListening,
+                            landscapeVirtualScreen = activeLandscapeVirtualScreen,
                             lastSavedSessionId = activeSessionId,
                             lastSavedTitle = resolvedTitle,
                             lastSavedAutoAnalyzed = shouldAutoAnalyze,
@@ -1821,6 +2085,7 @@ class MeetingRecorderService : Service() {
                             lastSavedPublicVideoPath = savedPublicDisplayPath
                         )
                     }
+                    MeetingRecoveryManager.clearCheckpoint(applicationContext)
                 } else {
                     runCatching { finalAudioFile?.delete() }
                     runCatching { activeOutputFile?.delete() }
@@ -1844,11 +2109,13 @@ class MeetingRecorderService : Service() {
                             enableVirtualMic = activeEnableVirtualMic,
                             silentSpeakerIsolation = activeSilentSpeaker,
                             keepAmbientBrainListening = activeKeepAmbientListening,
+                            landscapeVirtualScreen = activeLandscapeVirtualScreen,
                             lastError = existingErr ?: if (!discardAudio) {
                                 "Recording was under 1 second or had no captured video/audio."
                             } else null
                         )
                     }
+                    MeetingRecoveryManager.clearCheckpoint(applicationContext)
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "Error during meeting recorder finalization", t)
@@ -1886,12 +2153,14 @@ class MeetingRecorderService : Service() {
         runCatching {
             val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
             recordingCallback?.let { cb -> am?.unregisterAudioRecordingCallback(cb) }
+            commDeviceListener?.let { listener -> am?.removeOnCommunicationDeviceChangedListener(listener) }
             if (speakerphoneAppliedByUs) {
                 am?.clearCommunicationDevice()
                 speakerphoneAppliedByUs = false
             }
         }
         recordingCallback = null
+        commDeviceListener = null
 
         runCatching { internalAudioRecord?.release() }
         internalAudioRecord = null
@@ -2117,6 +2386,99 @@ class MeetingRecorderService : Service() {
         return "$cleanApp Recording ($timeFmt)"
     }
 
+    private fun isBluetoothDeviceType(type: Int?): Boolean {
+        return type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+            type == AudioDeviceInfo.TYPE_BLE_SPEAKER
+    }
+
+    private fun isBluetoothCommunicationRouteActive(): Boolean {
+        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return false
+        return runCatching {
+            isBluetoothDeviceType(am.communicationDevice?.type) ||
+                @Suppress("DEPRECATION") am.isBluetoothScoOn
+        }.getOrDefault(false)
+    }
+
+    private fun registerBluetoothRouteMonitor() {
+        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        commDeviceListener?.let { prev ->
+            runCatching { am.removeOnCommunicationDeviceChangedListener(prev) }
+        }
+        val listener = AudioManager.OnCommunicationDeviceChangedListener { device ->
+            val btActive = isBluetoothDeviceType(device?.type) || isBluetoothCommunicationRouteActive()
+            MeetingRecorderStateBus.update { st ->
+                if (!st.isRecording) st else st.copy(bluetoothScoActive = btActive)
+            }
+        }
+        commDeviceListener = listener
+        runCatching {
+            am.addOnCommunicationDeviceChangedListener(mainExecutor, listener)
+        }
+    }
+
+    private fun saveActiveRecoveryCheckpoint() {
+        MeetingRecoveryManager.saveCheckpoint(
+            context = applicationContext,
+            checkpoint = PendingMeetingCheckpoint(
+                sessionId = activeSessionId,
+                appLabel = activeTargetAppLabel.ifBlank { activePlatform.label },
+                targetPackageName = activeTargetPackageName.orEmpty(),
+                meetingTitle = activeMeetingTitle,
+                captureModeName = activeCaptureMode.name,
+                videoModeName = activeVideoMode.name,
+                isClinical = activeIsClinical,
+                ignoreInternalForGemini = activeIgnoreInternalForGemini,
+                startWallMs = sessionStartWallMs,
+                tempAudioPath = activeTempStealthAudioFile?.absolutePath.orEmpty(),
+                tempVideoPath = activeTempVideoFile?.absolutePath.orEmpty(),
+                privateAudioPath = activeOutputFile?.absolutePath.orEmpty()
+            )
+        )
+    }
+
+    private fun queryAvailableStorageMb(includeExternalCache: Boolean): Long {
+        val dirs = buildList {
+            add(filesDir)
+            if (includeExternalCache) externalCacheDir?.let { add(it) }
+        }
+        var minMb = Long.MAX_VALUE
+        for (dir in dirs) {
+            val avail = runCatching { StatFs(dir.absolutePath).availableBytes / (1024L * 1024L) }.getOrNull()
+            if (avail != null && avail < minMb) minMb = avail
+        }
+        return if (minMb == Long.MAX_VALUE) -1L else minMb
+    }
+
+    /**
+     * Checks live device storage during long meetings.
+     * Returns `true` if critical low storage triggered an automatic safe stop & finalize.
+     */
+    private fun checkLiveStorageSafety(includeExternalCache: Boolean): Boolean {
+        val availMb = queryAvailableStorageMb(includeExternalCache)
+        if (availMb < 0L) return false
+        if (availMb < CRITICAL_STOP_STORAGE_MB) {
+            Log.e(TAG, "Critical low storage (${availMb} MB free) — auto-stopping meeting recording to protect MP4 integrity")
+            MeetingRecorderStateBus.update { st ->
+                st.copy(
+                    lowStorageWarning = "Storage critically low (${availMb} MB). Auto-saving recording now...",
+                    lastError = "Auto-stopped recording because storage dropped below ${CRITICAL_STOP_STORAGE_MB} MB (${availMb} MB free) so your MP4 could finalize cleanly."
+                )
+            }
+            requestStopAndFinalize("Critical low storage (${availMb} MB free)")
+            return true
+        }
+        val warning = if (availMb < LIVE_WARN_STORAGE_MB) {
+            "Low storage (${availMb} MB free) — recording will auto-save cleanly below ${CRITICAL_STOP_STORAGE_MB} MB."
+        } else {
+            null
+        }
+        MeetingRecorderStateBus.update { st ->
+            if (!st.isRecording) st else st.copy(lowStorageWarning = warning)
+        }
+        return false
+    }
+
     companion object {
         private const val TAG = "MeetingRecorderService"
         private const val CHANNEL_ID = "meeting_recorder_channel"
@@ -2129,7 +2491,12 @@ class MeetingRecorderService : Service() {
         private const val MIC_SPEECH_RMS_THRESHOLD = 150f
         private const val MIN_MIC_SPEECH_FOR_GEMINI_MS = 1_500L
         private const val INTERNAL_SILENCE_HINT_SEC = 6L
+        private const val STEALTH_SILENCE_HINT_SEC = 10L
         private const val MIN_ANALYZE_BYTES = 4096L
+        private const val MIN_START_STORAGE_MB = 150L
+        private const val WARN_STORAGE_MB = 500L
+        private const val LIVE_WARN_STORAGE_MB = 250L
+        private const val CRITICAL_STOP_STORAGE_MB = 100L
 
         const val EXTRA_OPEN_MEETING_RECORDER = "open_meeting_recorder_dialog"
 
@@ -2140,6 +2507,7 @@ class MeetingRecorderService : Service() {
         private const val ACTION_MOVE_APP_TO_VIRTUAL = "com.ambientbrain.recorder.action.MEETING_MOVE_TO_VIRTUAL"
         private const val ACTION_BRING_APP_TO_MAIN = "com.ambientbrain.recorder.action.MEETING_BRING_TO_MAIN"
         private const val ACTION_TOGGLE_MINI_PREVIEW = "com.ambientbrain.recorder.action.MEETING_TOGGLE_MINI_PREVIEW"
+        private const val ACTION_REBIND_STEALTH_AUDIO = "com.ambientbrain.recorder.action.MEETING_REBIND_STEALTH_AUDIO"
 
         private const val EXTRA_RESULT_CODE = "extra_result_code"
         private const val EXTRA_RESULT_DATA = "extra_result_data"
@@ -2156,6 +2524,7 @@ class MeetingRecorderService : Service() {
         private const val EXTRA_SILENT_SPEAKER = "extra_silent_speaker"
         private const val EXTRA_KEEP_AMBIENT_LISTENING = "extra_keep_ambient_listening"
         private const val EXTRA_SHOW_MINI_PREVIEW = "extra_show_mini_preview"
+        private const val EXTRA_LANDSCAPE_VIRTUAL_SCREEN = "extra_landscape_virtual_screen"
         private const val EXTRA_SPEAKERPHONE_BOOST = "extra_speakerphone_boost"
 
         fun formatDuration(totalSec: Long): String {
@@ -2216,6 +2585,7 @@ class MeetingRecorderService : Service() {
             silentSpeaker: Boolean = true,
             keepAmbientBrainListening: Boolean = true,
             showMiniPreviewOnStart: Boolean = false,
+            landscapeVirtualScreen: Boolean = false,
             enableSpeakerphoneBoost: Boolean = false,
             projectionResultCode: Int = Activity.RESULT_CANCELED,
             projectionData: Intent? = null
@@ -2239,6 +2609,7 @@ class MeetingRecorderService : Service() {
                 putExtra(EXTRA_SILENT_SPEAKER, silentSpeaker)
                 putExtra(EXTRA_KEEP_AMBIENT_LISTENING, keepAmbientBrainListening)
                 putExtra(EXTRA_SHOW_MINI_PREVIEW, showMiniPreviewOnStart)
+                putExtra(EXTRA_LANDSCAPE_VIRTUAL_SCREEN, landscapeVirtualScreen)
                 putExtra(EXTRA_SPEAKERPHONE_BOOST, enableSpeakerphoneBoost)
                 putExtra(EXTRA_RESULT_CODE, projectionResultCode)
                 if (projectionData != null) {
@@ -2286,6 +2657,13 @@ class MeetingRecorderService : Service() {
         fun toggleMiniPreview(context: Context) {
             val intent = Intent(context, MeetingRecorderService::class.java).apply {
                 action = ACTION_TOGGLE_MINI_PREVIEW
+            }
+            runCatching { context.startService(intent) }
+        }
+
+        fun rebindStealthAudio(context: Context) {
+            val intent = Intent(context, MeetingRecorderService::class.java).apply {
+                action = ACTION_REBIND_STEALTH_AUDIO
             }
             runCatching { context.startService(intent) }
         }

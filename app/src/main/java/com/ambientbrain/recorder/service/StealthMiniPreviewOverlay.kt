@@ -193,16 +193,11 @@ class StealthMiniPreviewOverlay(
                     val bmp = BitmapFactory.decodeFile(file.absolutePath, opts) ?: return@execute
                     mainHandler.post {
                         if (isDismissed.get()) {
-                            runCatching { bmp.recycle() }
                             return@post
                         }
-                        val prev = currentBitmap
                         currentBitmap = bmp
                         previewImageView?.setImageBitmap(bmp)
                         previewPlaceholder?.visibility = View.GONE
-                        if (prev != null && prev !== bmp && !prev.isRecycled) {
-                            runCatching { prev.recycle() }
-                        }
                     }
                 } catch (t: Throwable) {
                     Log.w(TAG, "Failed decoding Stealth preview JPEG: ${t.message}")
@@ -235,9 +230,6 @@ class StealthMiniPreviewOverlay(
                 }
             }
             previewImageView?.setImageDrawable(null)
-            currentBitmap?.let { bmp ->
-                if (!bmp.isRecycled) runCatching { bmp.recycle() }
-            }
             currentBitmap = null
             rootContainer = null
             expandedCard = null
@@ -258,12 +250,13 @@ class StealthMiniPreviewOverlay(
     private fun buildOverlayViews(): FrameLayout {
         val root = FrameLayout(context)
 
-        // Compute proportional viewport dimensions (~200dp wide, capped to 360dp tall)
+        // Compute proportional viewport dimensions (wider for 16:9 landscape slides, tall for portrait)
         val vdW = session.widthPx.coerceAtLeast(320)
         val vdH = session.heightPx.coerceAtLeast(320)
+        val isLandscape = vdW > vdH
         val aspect = vdH.toFloat() / vdW.toFloat()
-        val maxViewportW = dp(200)
-        val maxViewportH = dp(350)
+        val maxViewportW = if (isLandscape) dp(264) else dp(200)
+        val maxViewportH = if (isLandscape) dp(220) else dp(350)
         var vpW = maxViewportW
         var vpH = (vpW * aspect).roundToInt()
         if (vpH > maxViewportH) {
