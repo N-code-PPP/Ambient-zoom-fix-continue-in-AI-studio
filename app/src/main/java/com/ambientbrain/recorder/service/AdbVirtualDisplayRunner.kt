@@ -1943,24 +1943,49 @@ object AdbVirtualDisplayRunner {
 
                     // 2b. Verify `input -d <id>` touch/key injection against the live virtual display
                     if (id > 0) {
+                        var injectDetail = ""
                         val injectOk = try {
                             val proc = ProcessBuilder("input", "-d", id.toString(), "keyevent", "0")
                                 .redirectErrorStream(true)
                                 .start()
+                            val outRef = AtomicReference("")
+                            val drainThread = Thread({
+                                runCatching {
+                                    outRef.set(proc.inputStream.bufferedReader().use { it.readText().trim().take(240) })
+                                }
+                            }, "InputProbe-Drain").apply {
+                                isDaemon = true
+                                start()
+                            }
                             val done = proc.waitFor(3, TimeUnit.SECONDS)
                             if (!done) {
                                 runCatching { proc.destroyForcibly() }
+                                runCatching { proc.inputStream.close() }
+                                runCatching { drainThread.join(250L) }
+                                injectDetail = "timed out after 3s"
                                 false
                             } else {
-                                proc.exitValue() == 0
+                                runCatching { drainThread.join(300L) }
+                                val code = proc.exitValue()
+                                val outText = outRef.get()
+                                if (code == 0) {
+                                    true
+                                } else {
+                                    injectDetail = if (outText.isNotBlank()) "exit=$code: $outText" else "exit=$code"
+                                    false
+                                }
                             }
-                        } catch (_: Throwable) {
+                        } catch (t: Throwable) {
+                            injectDetail = t.message ?: t.javaClass.simpleName
                             false
                         }
                         if (injectOk) {
                             emitLine("SELFTEST_ITEM:TOUCH_INJECT:PASS:input -d #$id accepted remote input injection")
                         } else {
-                            emitLine("SELFTEST_ITEM:TOUCH_INJECT:WARN:input -d #$id rejected or timed out (touch forwarding in mini-preview may be restricted on this ROM)")
+                            val reason = if (injectDetail.isNotBlank()) " ($injectDetail)" else ""
+                            emitLine(
+                                "SELFTEST_ITEM:TOUCH_INJECT:WARN:input -d #$id restricted$reason. On Xiaomi/HyperOS, enable Developer Options -> USB debugging (Security settings) for mini-preview touch forwarding; video & audio isolation still work."
+                            )
                         }
                     }
 

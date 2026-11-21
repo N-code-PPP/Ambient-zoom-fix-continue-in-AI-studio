@@ -452,6 +452,21 @@ object ShizukuAdbManager {
         }
     }
 
+    private fun unwrapThrowable(t: Throwable): Throwable {
+        var cur: Throwable = t
+        while (cur is java.lang.reflect.InvocationTargetException && cur.targetException != null) {
+            cur = cur.targetException
+        }
+        return cur
+    }
+
+    private fun formatThrowableSummary(t: Throwable): String {
+        val root = unwrapThrowable(t)
+        val cls = root.javaClass.simpleName
+        val msg = root.message?.trim().orEmpty()
+        return if (msg.isNotEmpty()) "$cls: $msg" else cls
+    }
+
     private fun executeShizukuProcess(command: String): java.lang.Process {
         val method = Shizuku::class.java.getDeclaredMethod(
             "newProcess",
@@ -460,11 +475,79 @@ object ShizukuAdbManager {
             String::class.java
         )
         method.isAccessible = true
-        return method.invoke(null, arrayOf("sh", "-c", command), null, null) as java.lang.Process
+        return try {
+            method.invoke(null, arrayOf("sh", "-c", command), null, null) as java.lang.Process
+        } catch (ite: java.lang.reflect.InvocationTargetException) {
+            throw (ite.targetException ?: ite)
+        }
     }
 
     internal fun openShizukuShellProcess(command: String): java.lang.Process {
         return executeShizukuProcess(command)
+    }
+
+    /**
+     * Binder-safe timed wait for a [rikka.shizuku.ShizukuRemoteProcess].
+     *
+     * `ShizukuRemoteProcess` does NOT override `Process.waitFor(long, TimeUnit)`. Java's default
+     * implementation polls `exitValue()` catching only `IllegalThreadStateException`, whereas
+     * Android Binder marshals `IllegalThreadStateException` as plain `IllegalArgumentException`
+     * ("process hasn't exited"), causing timed `waitFor` to abort immediately on the first poll.
+     *
+     * Calling the overridden blocking 0-arg `proc.waitFor()` on a dedicated waiter thread avoids
+     * `exitValue()` polling entirely while preserving strict caller timeouts. Returns the process
+     * exit code if it exited before [timeoutMs], or `null` if it timed out.
+     */
+    internal fun waitForShizukuProcess(proc: java.lang.Process, timeoutMs: Long): Int? {
+        val boundedMs = timeoutMs.coerceAtLeast(100L)
+        val exitCodeRef = java.util.concurrent.atomic.AtomicReference<Int?>(null)
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val waiter = Thread({
+            try {
+                exitCodeRef.set(proc.waitFor())
+            } catch (_: InterruptedException) {
+                // Interrupted on timeout or cancellation
+            } catch (_: Throwable) {
+                // Defensive fallback: poll exitValue() catching BOTH IllegalThreadStateException
+                // and Binder-downgraded IllegalArgumentException until deadline.
+                val deadlineMs = SystemClock.elapsedRealtime() + boundedMs
+                while (!Thread.currentThread().isInterrupted && SystemClock.elapsedRealtime() < deadlineMs) {
+                    try {
+                        exitCodeRef.set(proc.exitValue())
+                        break
+                    } catch (_: IllegalThreadStateException) {
+                        // Still running
+                    } catch (_: IllegalArgumentException) {
+                        // Shizuku Binder marshaled "process hasn't exited"
+                    } catch (_: Throwable) {
+                        break
+                    }
+                    try {
+                        Thread.sleep(50L)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+            } finally {
+                latch.countDown()
+            }
+        }, "Shizuku-WaitFor").apply {
+            isDaemon = true
+            start()
+        }
+
+        val completed = try {
+            latch.await(boundedMs, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+
+        if (!completed) {
+            waiter.interrupt()
+            return null
+        }
+        return exitCodeRef.get()
     }
 
     private data class ProcessExecResult(
@@ -517,13 +600,14 @@ object ShizukuAdbManager {
             start()
         }
 
-        val finished = proc.waitFor(timeoutSec.coerceAtLeast(2L), TimeUnit.SECONDS)
-        if (!finished) {
+        val exitCode = waitForShizukuProcess(proc, timeoutSec.coerceAtLeast(2L) * 1_000L)
+        if (exitCode == null) {
+            runCatching { proc.destroy() }
             runCatching { proc.destroyForcibly() }
             runCatching { proc.inputStream.close() }
             runCatching { proc.errorStream.close() }
-            runCatching { outThread.join(300L) }
-            runCatching { errThread.join(300L) }
+            runCatching { outThread.join(400L) }
+            runCatching { errThread.join(400L) }
             return ProcessExecResult(
                 exitCode = -1,
                 stdout = outRef.get(),
@@ -532,10 +616,10 @@ object ShizukuAdbManager {
             )
         }
 
-        runCatching { outThread.join(500L) }
-        runCatching { errThread.join(500L) }
+        runCatching { outThread.join(1_000L) }
+        runCatching { errThread.join(1_000L) }
         return ProcessExecResult(
-            exitCode = proc.exitValue(),
+            exitCode = exitCode,
             stdout = outRef.get(),
             stderr = errRef.get(),
             timedOut = false
@@ -543,8 +627,9 @@ object ShizukuAdbManager {
     }
 
     internal fun runShizukuShellCommand(command: String, timeoutSec: Long = 10L): Pair<Int, String> {
+        var proc: java.lang.Process? = null
         return try {
-            val proc = executeShizukuProcess(command)
+            proc = executeShizukuProcess(command)
             val res = runProcessWithTimeout(proc, timeoutSec)
             val combined = buildString {
                 if (res.stdout.isNotEmpty()) append(res.stdout)
@@ -559,7 +644,10 @@ object ShizukuAdbManager {
             }
             res.exitCode to combined
         } catch (t: Throwable) {
-            -1 to (t.message ?: t.javaClass.simpleName)
+            runCatching { proc?.destroyForcibly() }
+            val errSummary = formatThrowableSummary(t)
+            Log.w(TAG, "runShizukuShellCommand failed: $errSummary")
+            -1 to errSummary
         }
     }
 
@@ -694,7 +782,7 @@ object ShizukuAdbManager {
 
             val execRes = runProcessWithTimeout(
                 proc = process,
-                timeoutSec = 4L,
+                timeoutSec = 6L,
                 maxOutputBytes = 1024 * 1024
             )
             execRes.stdout.lineSequence().let { lines ->
@@ -936,14 +1024,15 @@ object ShizukuAdbManager {
                 error = null
             )
         } catch (e: Exception) {
-            Log.w(TAG, "dumpsys audio inspection failed: ${e.message}")
+            val errSummary = formatThrowableSummary(e)
+            Log.w(TAG, "dumpsys audio inspection failed: $errSummary")
             AudioInspectorSnapshot(
                 capturedAtMs = capturedAt,
                 audioModeLine = audioManager?.let { "AudioManager.mode=${it.mode}" },
                 clients = emptyList(),
                 maxPhantomProcesses = null,
                 rawExcerpt = "",
-                error = "Inspection failed: ${e.message ?: e::class.java.simpleName}"
+                error = "Inspection failed: $errSummary"
             )
         }
     }
@@ -1130,12 +1219,13 @@ object ShizukuAdbManager {
                     }
                 }
             } catch (e: Exception) {
+                val errSummary = formatThrowableSummary(e)
                 if (spec.optional) {
                     optionalSkipped++
-                    logBuilder.append("Optional step exception: ").append(e.message).append("\n")
+                    logBuilder.append("Optional step exception: ").append(errSummary).append("\n")
                 } else {
                     allRequiredSuccess = false
-                    logBuilder.append("Exception: ").append(e.message).append("\n")
+                    logBuilder.append("Exception: ").append(errSummary).append("\n")
                 }
             }
         }

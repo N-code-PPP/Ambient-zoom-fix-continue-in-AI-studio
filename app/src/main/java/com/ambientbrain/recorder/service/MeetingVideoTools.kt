@@ -603,10 +603,7 @@ object AdbVirtualScreenController {
                 readyLatch.countDown()
                 stopLatch.countDown()
                 if (readyCompleted.get() && !sawCleanStop.get() && !stopRequested.get()) {
-                    val exitCode = runCatching {
-                        process.waitFor(300, TimeUnit.MILLISECONDS)
-                        process.exitValue()
-                    }.getOrDefault(-1)
+                    val exitCode = ShizukuAdbManager.waitForShizukuProcess(process, 600L) ?: -1
                     val errText = errorMessage.get()
                         ?: synchronized(stderrBuffer) { stderrBuffer.toString().trim().takeIf { it.isNotBlank() } }
                     Log.w(TAG, "ADB Virtual Display runner exited unexpectedly (code=$exitCode, err=$errText)")
@@ -858,30 +855,51 @@ object AdbVirtualScreenController {
             )
         }
 
-        // 2. Verify task discovery & RootTask moving via `am stack list`
+        // 2. Verify task discovery & RootTask moving via `am stack list` (+ `dumpsys activity recents` fallback)
         val (stackCode, stackOut) = ShizukuAdbManager.runShizukuShellCommand(
             "am stack list 2>/dev/null | head -n 40",
             timeoutSec = 5L
         )
         val hasRootTask = stackCode == 0 && stackOut.contains("RootTask id=", ignoreCase = true)
-        items.add(
-            if (hasRootTask) {
+        if (hasRootTask) {
+            items.add(
                 SelfTestCheckItem(
                     id = "TASK_MOVE",
                     title = "WindowManager Task Routing (am stack list)",
                     status = SelfTestStatus.PASS,
                     detail = "RootTask IDs readable — active calls can move seamlessly without relaunching."
                 )
-            } else {
-                SelfTestCheckItem(
-                    id = "TASK_MOVE",
-                    title = "WindowManager Task Routing (am stack list)",
-                    status = SelfTestStatus.WARN,
-                    detail = "am stack list returned limited output (code=$stackCode); will fall back to dumpsys recents."
+            )
+            rawLog.appendLine("TASK_MOVE: hasRootTask=true (code=$stackCode)")
+        } else {
+            val (recentsCode, recentsOut) = ShizukuAdbManager.runShizukuShellCommand(
+                "dumpsys activity recents 2>/dev/null | head -n 80",
+                timeoutSec = 5L
+            )
+            val hasRecentsTasks = recentsCode == 0 && (
+                recentsOut.contains("Recent #", ignoreCase = true) ||
+                    recentsOut.contains("taskId=", ignoreCase = true) ||
+                    recentsOut.contains("id=", ignoreCase = true)
                 )
-            }
-        )
-        rawLog.appendLine("TASK_MOVE: hasRootTask=$hasRootTask (code=$stackCode)")
+            items.add(
+                if (hasRecentsTasks) {
+                    SelfTestCheckItem(
+                        id = "TASK_MOVE",
+                        title = "WindowManager Task Routing (dumpsys recents)",
+                        status = SelfTestStatus.PASS,
+                        detail = "Task routing ready via dumpsys activity recents (am stack list deprecated on this ROM, code=$stackCode)."
+                    )
+                } else {
+                    SelfTestCheckItem(
+                        id = "TASK_MOVE",
+                        title = "WindowManager Task Routing (am stack list)",
+                        status = SelfTestStatus.WARN,
+                        detail = "am stack list (code=$stackCode) & dumpsys recents (code=$recentsCode) returned limited output; will fall back to fresh display launch."
+                    )
+                }
+            )
+            rawLog.appendLine("TASK_MOVE: hasRootTask=false (stackCode=$stackCode), hasRecentsTasks=$hasRecentsTasks (recentsCode=$recentsCode)")
+        }
 
         // 3. Accessibility parallel room listening readiness
         val a11yBound = AmbientCaptureAccessibilityService.isSystemBound
@@ -974,8 +992,9 @@ object AdbVirtualScreenController {
         sendCommand(session, "STOP")
         runCatching { session.stdinWriter.close() }
         runCatching { session.stopLatch.await(6, TimeUnit.SECONDS) }
-        val exited = runCatching { session.process.waitFor(2, TimeUnit.SECONDS) }.getOrDefault(false)
-        if (!exited) {
+        val exitCode = ShizukuAdbManager.waitForShizukuProcess(session.process, 2_500L)
+        if (exitCode == null) {
+            runCatching { session.process.destroy() }
             runCatching { session.process.destroyForcibly() }
         }
         session.previewFile?.let { pFile ->
