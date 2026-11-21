@@ -1261,10 +1261,7 @@ class CaptureEngine(private val context: Context) {
                     rawBytes = outFile.length(),
                     status = Status.QUEUED
                 )
-                db.upsertSession(entity)
-                if (segmentMaps.isNotEmpty()) {
-                    db.insertSegmentMaps(segmentMaps.toList())
-                }
+                db.insertSessionWithSegmentMaps(entity, segmentMaps.toList())
                 lastFinalizedEndWallMs = endWallMs
                 activeEventGroupId = if (preserveEventContinuation) resolvedEventGroupId else null
                 Log.i(

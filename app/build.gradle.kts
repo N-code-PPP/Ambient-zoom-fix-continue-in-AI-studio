@@ -91,11 +91,28 @@ android {
         checkReleaseBuilds = false
         abortOnError = false
     }
+
+    sourceSets {
+        // Expose exported Room schemas to Robolectric unit tests (debug only; never packaged in release APKs)
+        // and to instrumented androidTest MigrationTestHelper runs.
+        getByName("debug").assets.srcDir("$projectDir/schemas")
+        getByName("androidTest").assets.srcDir("$projectDir/schemas")
+    }
+
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+        }
+    }
 }
 
 ksp {
     arg("room.schemaLocation", "$projectDir/schemas")
     arg("room.incremental", "true")
+}
+
+tasks.matching { it.name == "mergeDebugAssets" }.configureEach {
+    mustRunAfter(tasks.matching { it.name == "kspDebugKotlin" })
 }
 
 dependencies {
@@ -133,4 +150,10 @@ dependencies {
 
     implementation(libs.shizuku.api)
     implementation(libs.shizuku.provider)
+
+    testImplementation(libs.junit)
+    testImplementation(libs.androidx.room.testing)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core.ktx)
+    testImplementation(libs.androidx.test.ext.junit)
 }

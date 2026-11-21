@@ -319,6 +319,14 @@ jobs:
               f.write(f"tag={next_tag}\n")
           PY
 
+      - name: Run Unit & DB Migration Tests
+        run: |
+          if [ -f gradle/wrapper/gradle-wrapper.jar ] && unzip -tq gradle/wrapper/gradle-wrapper.jar >/dev/null 2>&1; then
+            ./gradlew :app:testDebugUnitTest --build-cache --parallel --stacktrace --no-daemon
+          else
+            gradle :app:testDebugUnitTest --build-cache --parallel --stacktrace --no-daemon
+          fi
+
       - name: Build APK(s)
         env:
           CI_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}

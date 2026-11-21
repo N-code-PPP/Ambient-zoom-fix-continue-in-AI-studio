@@ -276,7 +276,7 @@ data class BackupAudioFileManifestEntry(
 data class BackupManifest(
     val format: String = AppDataExporter.ZIP_BACKUP_FORMAT,
     val bundleVersion: Int = 1,
-    val dbSchemaVersion: Int = 6,
+    val dbSchemaVersion: Int = AppDatabase.DB_VERSION,
     val appVersionName: String = "",
     val appVersionCode: Long = 0L,
     val exportedAtMs: Long = 0L,
@@ -2171,7 +2171,7 @@ object AppDataExporter {
         return BackupManifest(
             format = ZIP_BACKUP_FORMAT,
             bundleVersion = 1,
-            dbSchemaVersion = 6,
+            dbSchemaVersion = AppDatabase.DB_VERSION,
             appVersionName = pkgInfo?.versionName.orEmpty(),
             appVersionCode = pkgInfo?.longVersionCode ?: 0L,
             exportedAtMs = nowMs,
@@ -2478,6 +2478,8 @@ object AppDataExporter {
             }
 
             if (dataset.filteredSessions.isNotEmpty()) {
+                val segmentMapsBySession = dataset.segmentMaps.groupBy { it.sessionId }
+                val sessionsById = dataset.exportSessions.associateBy { it.id }
                 append("---\n\n## Sessions, Clinical Rounds & Transcripts\n\n")
                 dataset.filteredSessions.forEach { details ->
                     val s = details.session
@@ -2507,9 +2509,58 @@ object AppDataExporter {
                         }
                     }
                     if (details.sentences.isNotEmpty() && dataset.sentences.isNotEmpty()) {
+                        val sessionSegments = segmentMapsBySession[s.id].orEmpty()
+                        val combinedSourceSpans: List<Triple<SessionEntity, Long, Long>> = if (
+                            !s.combinedSourceIdsJson.isNullOrBlank() &&
+                            s.reviewSourceMode != "EXTRACTED_ONLY"
+                        ) {
+                            val srcIds = runCatching {
+                                json.decodeFromString<List<String>>(s.combinedSourceIdsJson)
+                            }.getOrNull().orEmpty()
+                            val srcEntities = srcIds.mapNotNull { sessionsById[it] }.sortedBy { it.startMs }
+                            if (srcEntities.size == srcIds.size && srcEntities.isNotEmpty()) {
+                                var offset = 0L
+                                srcEntities.map { src ->
+                                    val spanDur = if (src.speechMs > 0L) {
+                                        src.speechMs
+                                    } else {
+                                        (src.endMs - src.startMs).coerceAtLeast(1_000L)
+                                    }
+                                    val entry = Triple(src, offset, spanDur)
+                                    offset += spanDur
+                                    entry
+                                }
+                            } else {
+                                emptyList()
+                            }
+                        } else {
+                            emptyList()
+                        }
                         append("\n**Transcript (${details.sentences.size} lines):**\n\n")
                         details.sentences.sortedBy { it.ordinal }.forEach { line ->
-                            val ts = timeOnlyFmt.format(Date(s.startMs + line.approxMs))
+                            val wallMs = when {
+                                s.combinedSourceIdsJson.isNullOrBlank() && sessionSegments.isNotEmpty() -> {
+                                    ClipSlicer.resolveCompactedTimestamp(
+                                        rawInputMs = line.approxMs,
+                                        segments = sessionSegments,
+                                        sessionStartMs = s.startMs
+                                    ).wallClockMs
+                                }
+                                combinedSourceSpans.isNotEmpty() -> {
+                                    val matchedSpan = combinedSourceSpans.lastOrNull { it.second <= line.approxMs }
+                                        ?: combinedSourceSpans.first()
+                                    val (srcSession, globalOffset, spanDur) = matchedSpan
+                                    val localMs = (line.approxMs - globalOffset).coerceAtLeast(0L)
+                                    ClipSlicer.resolveCompactedTimestamp(
+                                        rawInputMs = localMs,
+                                        segments = segmentMapsBySession[srcSession.id].orEmpty(),
+                                        sessionStartMs = srcSession.startMs,
+                                        maxFileDurationMs = spanDur
+                                    ).wallClockMs
+                                }
+                                else -> s.startMs + line.approxMs
+                            }
+                            val ts = timeOnlyFmt.format(Date(wallMs))
                             append("- `[").append(ts).append("]` **").append(line.speakerLabel).append("**: ")
                                 .append(line.textOriginal)
                             if (!line.textEn.isNullOrBlank() && line.textEn != line.textOriginal) {

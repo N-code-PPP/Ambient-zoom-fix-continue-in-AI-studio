@@ -2049,10 +2049,7 @@ class MeetingRecorderService : Service() {
                     )
 
                     val dao = AppDatabase.get(applicationContext).dao()
-                    dao.upsertSession(entity)
-                    if (segmentMaps.isNotEmpty()) {
-                        dao.insertSegmentMaps(segmentMaps.toList())
-                    }
+                    dao.insertSessionWithSegmentMaps(entity, segmentMaps.toList())
 
                     if (shouldAutoAnalyze) {
                         SessionAnalyzeWorker.enqueue(applicationContext, activeSessionId)

@@ -888,8 +888,7 @@ private fun AmbientBrainMainApp(
                                     title = newItem.title.take(30),
                                     summary = newItem.details.ifBlank { "Manual user note" }
                                 )
-                                dao.upsertSession(session)
-                                dao.insertItems(listOf(newItem))
+                                dao.insertSessionWithItem(session, newItem)
                                 Toast.makeText(context, "Note saved to Inbox!", Toast.LENGTH_SHORT).show()
                             }
                         }

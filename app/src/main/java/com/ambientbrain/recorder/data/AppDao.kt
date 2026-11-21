@@ -6,13 +6,35 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
 import androidx.room.Update
+import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
+
+data class SpeakerProfileRename(
+    val speakerId: String,
+    val newLabel: String,
+    val matchedProfileId: String?,
+    val nickname: String?,
+    val relatableTitle: String?,
+    val voiceSignature: String?,
+    val isAutoEnrolled: Boolean
+)
+
+enum class NoMeaningfulPersistOutcome {
+    SESSION_DELETED,
+    PRESERVED_PRIOR_DATA,
+    MARKED_NO_MEANINGFUL
+}
 
 @Dao
 interface AppDao {
 
     // --- Sessions ---
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    /**
+     * Inserts a new session or updates an existing session in-place via Room `@Upsert`
+     * (`INSERT` with fallback to `UPDATE`), avoiding SQLite `INSERT OR REPLACE` which deletes
+     * the parent row and triggers `ON DELETE CASCADE` on child tables.
+     */
+    @Upsert
     suspend fun upsertSession(session: SessionEntity)
 
     @Update
@@ -68,7 +90,7 @@ interface AppDao {
         SELECT * FROM sessions
         WHERE endMs >= :sinceEpochMs
           AND id != :excludeSessionId
-          AND context != 'NOISE_OR_TV'
+          AND (context IS NULL OR context != 'NOISE_OR_TV')
           AND combinedSourceIdsJson IS NULL
           AND status IN ('DONE', 'ANALYZING', 'CLIPPING', 'QUEUED')
         ORDER BY endMs DESC
@@ -86,7 +108,7 @@ interface AppDao {
           AND id != :excludeSessionId
           AND combinedSourceIdsJson IS NULL
           AND status = 'DONE'
-          AND context != 'NOISE_OR_TV'
+          AND (context IS NULL OR context != 'NOISE_OR_TV')
         ORDER BY startMs DESC
         LIMIT 2
         """
@@ -341,6 +363,220 @@ interface AppDao {
     )
     suspend fun resetSessionForRetry(sessionId: String)
 
+    @Query(
+        """
+        UPDATE sessions
+        SET summary = CASE WHEN summary = :checkpointMarker THEN NULL ELSE summary END,
+            status = 'QUEUED',
+            retryCount = 0,
+            nextRetryEpochMs = 0,
+            lastError = NULL
+        WHERE id = :sessionId
+        """
+    )
+    suspend fun resetSessionForFreshRetry(sessionId: String, checkpointMarker: String): Int
+
+    @Query("UPDATE sessions SET status = :status WHERE id = :sessionId")
+    suspend fun updateSessionStatus(sessionId: String, status: Status): Int
+
+    @Query("UPDATE sessions SET status = :status, lastError = :lastError WHERE id = :sessionId")
+    suspend fun updateSessionStatusAndError(sessionId: String, status: Status, lastError: String?): Int
+
+    @Query(
+        """
+        UPDATE sessions
+        SET status = 'QUEUED', nextRetryEpochMs = :nextRetryEpochMs, lastError = :lastError
+        WHERE id = :sessionId
+        """
+    )
+    suspend fun updateSessionPausedState(sessionId: String, nextRetryEpochMs: Long, lastError: String?): Int
+
+    @Query(
+        """
+        UPDATE sessions
+        SET summary = :summary, status = 'QUEUED', nextRetryEpochMs = :nextRetryEpochMs, lastError = :lastError
+        WHERE id = :sessionId
+        """
+    )
+    suspend fun updateSessionStage2CheckpointPaused(
+        sessionId: String,
+        summary: String,
+        nextRetryEpochMs: Long,
+        lastError: String?
+    ): Int
+
+    @Query(
+        """
+        UPDATE sessions
+        SET status = :status, retryCount = :retryCount, nextRetryEpochMs = :nextRetryEpochMs, lastError = :lastError
+        WHERE id = :sessionId
+        """
+    )
+    suspend fun updateSessionQueueOrFailureState(
+        sessionId: String,
+        status: Status,
+        retryCount: Int,
+        nextRetryEpochMs: Long,
+        lastError: String?
+    ): Int
+
+    @Query(
+        """
+        UPDATE sessions
+        SET summary = :summary,
+            status = :status,
+            retryCount = :retryCount,
+            nextRetryEpochMs = :nextRetryEpochMs,
+            lastError = :lastError
+        WHERE id = :sessionId
+        """
+    )
+    suspend fun updateSessionStage2CheckpointFailure(
+        sessionId: String,
+        summary: String,
+        status: Status,
+        retryCount: Int,
+        nextRetryEpochMs: Long,
+        lastError: String?
+    ): Int
+
+    @Query("UPDATE sessions SET nextRetryEpochMs = 0, lastError = NULL WHERE id = :sessionId")
+    suspend fun clearSessionRetryError(sessionId: String): Int
+
+    @Query(
+        """
+        UPDATE sessions
+        SET rawPath = :rawPath,
+            rawBytes = :rawBytes,
+            isRawPurged = 0,
+            status = 'QUEUED',
+            retryCount = 0,
+            nextRetryEpochMs = 0,
+            lastError = NULL
+        WHERE id = :sessionId
+        """
+    )
+    suspend fun updateSessionRawAudioAndQueue(sessionId: String, rawPath: String, rawBytes: Long): Int
+
+    @Query(
+        """
+        UPDATE sessions
+        SET status = 'DONE', summary = :summary, retryCount = 0, nextRetryEpochMs = 0, lastError = NULL
+        WHERE id = :sessionId
+        """
+    )
+    suspend fun completeSessionExcludedMeeting(sessionId: String, summary: String): Int
+
+    @Query(
+        """
+        UPDATE sessions
+        SET rawPath = :rawPath,
+            rawBytes = :rawBytes,
+            isRawPurged = CASE WHEN :rawPath IS NULL THEN 1 ELSE 0 END,
+            eventGroupId = :eventGroupId,
+            context = :context,
+            title = :title,
+            summary = :summary,
+            keyPointsJson = NULL,
+            status = 'DONE',
+            retryCount = 0,
+            nextRetryEpochMs = 0,
+            lastError = NULL
+        WHERE id = :sessionId
+        """
+    )
+    suspend fun updateSessionNoMeaningfulFields(
+        sessionId: String,
+        rawPath: String?,
+        rawBytes: Long,
+        eventGroupId: String?,
+        context: String?,
+        title: String?,
+        summary: String?
+    ): Int
+
+    @Query(
+        """
+        UPDATE sessions
+        SET eventGroupId = :eventGroupId,
+            title = :title,
+            summary = :summary,
+            status = 'ANALYZING',
+            retryCount = 0,
+            nextRetryEpochMs = 0,
+            lastError = NULL
+        WHERE id = :sessionId
+        """
+    )
+    suspend fun updateSessionStage1CheckpointFields(
+        sessionId: String,
+        eventGroupId: String?,
+        title: String?,
+        summary: String
+    ): Int
+
+    @Query(
+        """
+        UPDATE sessions
+        SET mode = :mode,
+            roundGroupId = :roundGroupId,
+            eventGroupId = :eventGroupId,
+            context = :context,
+            title = :title,
+            summary = :summary,
+            keyPointsJson = :keyPointsJson,
+            status = 'DONE',
+            retryCount = 0,
+            nextRetryEpochMs = 0,
+            lastError = NULL
+        WHERE id = :sessionId
+        """
+    )
+    suspend fun updateSessionCompletedFields(
+        sessionId: String,
+        mode: SessionMode,
+        roundGroupId: String?,
+        eventGroupId: String?,
+        context: String?,
+        title: String?,
+        summary: String?,
+        keyPointsJson: String?
+    ): Int
+
+    @Query(
+        """
+        UPDATE sessions
+        SET mode = :mode,
+            roundGroupId = :roundGroupId,
+            eventGroupId = :eventGroupId,
+            context = :context,
+            title = :title,
+            summary = :summary,
+            keyPointsJson = :keyPointsJson,
+            status = 'DONE',
+            retryCount = 0,
+            nextRetryEpochMs = 0,
+            lastError = NULL,
+            aiReviewReport = :aiReviewReport,
+            reviewedAtMs = :reviewedAtMs,
+            reviewSourceMode = :reviewSourceMode
+        WHERE id = :sessionId
+        """
+    )
+    suspend fun updateSessionCompletedWithReviewFields(
+        sessionId: String,
+        mode: SessionMode,
+        roundGroupId: String?,
+        eventGroupId: String?,
+        context: String?,
+        title: String?,
+        summary: String?,
+        keyPointsJson: String?,
+        aiReviewReport: String?,
+        reviewedAtMs: Long,
+        reviewSourceMode: String?
+    ): Int
+
     // --- Analysis Runs & Token Metrics ---
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAnalysisRun(run: AnalysisRunEntity)
@@ -430,18 +666,317 @@ interface AppDao {
     suspend fun countMatchingAnalysisRun(sessionId: String, atMs: Long, promptVersion: String): Int
 
     /**
-     * Inserts a new session or updates an existing one in-place via `@Update`
+     * Inserts a new session or updates an existing one in-place via `@Upsert`
      * (never using `REPLACE` on an existing row, which would trigger `ON DELETE CASCADE`
      * on child tables in SQLite).
      */
     @Transaction
     suspend fun upsertSessionSafelyNoCascade(session: SessionEntity) {
-        val existing = getSessionById(session.id)
-        if (existing == null) {
-            upsertSession(session)
-        } else {
-            updateSession(session)
+        upsertSession(session)
+    }
+
+    @Transaction
+    suspend fun insertSessionWithSegmentMaps(
+        session: SessionEntity,
+        segmentMaps: List<SegmentMapEntity>
+    ) {
+        upsertSession(session)
+        if (segmentMaps.isNotEmpty()) {
+            insertSegmentMaps(segmentMaps)
         }
+    }
+
+    @Transaction
+    suspend fun insertSessionWithItem(
+        session: SessionEntity,
+        item: ItemEntity
+    ) {
+        upsertSession(session)
+        insertItems(listOf(item))
+    }
+
+    /**
+     * Safe Preserve for sessions classified as having no meaningful content:
+     * - If the session already has real extracted notes/transcripts/patients/items, preserves all
+     *   prior metadata and child rows (never downgrading to `NOISE_OR_TV`), restores `Status.DONE`,
+     *   and records an informational notice in `lastError`.
+     * - Otherwise (brand-new or empty session), marks it `NOISE_OR_TV` / `DONE` while preserving `segment_map`.
+     */
+    @Transaction
+    suspend fun persistNoMeaningfulContentResult(
+        sessionId: String,
+        rawPath: String?,
+        rawBytes: Long,
+        eventGroupId: String?,
+        context: String?,
+        title: String?,
+        summary: String?,
+        checkpointMarker: String,
+        preserveNotice: String
+    ): NoMeaningfulPersistOutcome {
+        val current = getSessionWithDetailsOnce(sessionId)
+            ?: return NoMeaningfulPersistOutcome.SESSION_DELETED
+        val s = current.session
+        val rawSummary = s.summary?.trim().orEmpty()
+        val isPlaceholderMeetingSummary =
+            (rawSummary.startsWith("Recorded ", ignoreCase = true) ||
+                rawSummary.startsWith("Saved ", ignoreCase = true)) &&
+                (rawSummary.contains("recording (", ignoreCase = true) ||
+                    rawSummary.contains("Queued for Gemini", ignoreCase = true) ||
+                    rawSummary.contains("excluded from Gemini", ignoreCase = true) ||
+                    rawSummary.contains("mic-only track for Gemini", ignoreCase = true))
+        val isPlaceholderSummary = rawSummary.isBlank() ||
+            isPlaceholderMeetingSummary ||
+            rawSummary == "100% verbatim transcript completed" ||
+            rawSummary == checkpointMarker ||
+            rawSummary.equals("Filtered Background Audio", ignoreCase = true) ||
+            rawSummary.equals("Background audio or unclassified conversation.", ignoreCase = true) ||
+            rawSummary.startsWith("Automatically recovered interrupted ", ignoreCase = true) ||
+            rawSummary.contains("meeting saved locally", ignoreCase = true) ||
+            rawSummary.contains("no separate local speech detected", ignoreCase = true) ||
+            rawSummary.startsWith("Queued Gemini analysis", ignoreCase = true) ||
+            rawSummary.startsWith("Auto-merging & reviewing", ignoreCase = true) ||
+            rawSummary.startsWith("Synthesizing & reviewing", ignoreCase = true)
+
+        val isMarkedNonMeaningful = s.context == "NOISE_OR_TV" ||
+            s.status == Status.NOT_MEANINGFUL ||
+            s.status == Status.SKIPPED_NO_SPEECH
+        val hasPriorSummary = !isPlaceholderSummary && !isMarkedNonMeaningful
+        val hasPriorKeyPoints = !s.keyPointsJson.isNullOrBlank() && s.keyPointsJson.trim() != "[]"
+        val hasPriorReview = !s.aiReviewReport.isNullOrBlank()
+        val hasPriorExtractedData = hasPriorSummary ||
+            hasPriorKeyPoints ||
+            hasPriorReview ||
+            current.sentences.isNotEmpty() ||
+            current.patients.isNotEmpty() ||
+            current.items.isNotEmpty()
+
+        if (hasPriorExtractedData) {
+            updateSessionQueueOrFailureState(
+                sessionId = sessionId,
+                status = Status.DONE,
+                retryCount = 0,
+                nextRetryEpochMs = 0L,
+                lastError = preserveNotice
+            )
+            return NoMeaningfulPersistOutcome.PRESERVED_PRIOR_DATA
+        }
+
+        updateSessionNoMeaningfulFields(
+            sessionId = sessionId,
+            rawPath = rawPath,
+            rawBytes = rawBytes,
+            eventGroupId = eventGroupId,
+            context = context,
+            title = title,
+            summary = summary
+        )
+        return NoMeaningfulPersistOutcome.MARKED_NO_MEANINGFUL
+    }
+
+    /**
+     * Atomically saves the Two-Stage Stage 1 speakers, verbatim transcript, and checkpoint marker.
+     * Returns `false` if the session was deleted before commit.
+     */
+    @Transaction
+    suspend fun persistStage1Checkpoint(
+        sessionId: String,
+        speakers: List<SessionSpeakerEntity>,
+        sentences: List<TranscriptSentenceEntity>,
+        eventGroupId: String?,
+        title: String?,
+        checkpointMarker: String
+    ): Boolean {
+        if (getSessionById(sessionId) == null) return false
+        if (speakers.isNotEmpty()) {
+            deleteSpeakersForSession(sessionId)
+            insertSpeakers(speakers)
+        }
+        deleteSentencesForSession(sessionId)
+        if (sentences.isNotEmpty()) {
+            insertSentences(sentences)
+        }
+        updateSessionStage1CheckpointFields(
+            sessionId = sessionId,
+            eventGroupId = eventGroupId,
+            title = title,
+            summary = checkpointMarker
+        )
+        return true
+    }
+
+    /**
+     * Atomically persists Two-Stage Stage 2 retroactive speaker renames, patients, items,
+     * and DONE session fields while preserving Stage 1 transcript rows and `segment_map`.
+     * Returns `false` if the session was deleted before commit.
+     */
+    @Transaction
+    suspend fun persistStage2Synthesis(
+        sessionId: String,
+        speakerRenames: List<SpeakerProfileRename>,
+        patients: List<PatientBlockEntity>,
+        items: List<ItemEntity>,
+        mode: SessionMode,
+        roundGroupId: String?,
+        eventGroupId: String?,
+        context: String?,
+        title: String?,
+        summary: String?,
+        keyPointsJson: String?
+    ): Boolean {
+        if (getSessionById(sessionId) == null) return false
+        for (rename in speakerRenames) {
+            renameSpeakerProfileAcrossSession(
+                sessionId = sessionId,
+                speakerId = rename.speakerId,
+                newLabel = rename.newLabel,
+                matchedProfileId = rename.matchedProfileId,
+                nickname = rename.nickname,
+                relatableTitle = rename.relatableTitle,
+                voiceSignature = rename.voiceSignature,
+                isAutoEnrolled = rename.isAutoEnrolled
+            )
+        }
+        deletePatientsForSession(sessionId)
+        if (patients.isNotEmpty()) {
+            insertPatients(patients)
+        }
+        deleteItemsForSession(sessionId)
+        if (items.isNotEmpty()) {
+            insertItems(items)
+        }
+        updateSessionCompletedFields(
+            sessionId = sessionId,
+            mode = mode,
+            roundGroupId = roundGroupId,
+            eventGroupId = eventGroupId,
+            context = context,
+            title = title,
+            summary = summary,
+            keyPointsJson = keyPointsJson
+        )
+        return true
+    }
+
+    /**
+     * Atomically persists single-pass analysis results (including `INFO_EXTRACTION_EN`,
+     * `AI_REVIEW_FROM_AUDIO`, and `VERBATIM_ORIGINAL_TRANSCRIPT`).
+     * Returns `false` if the session was deleted before commit.
+     */
+    @Transaction
+    suspend fun persistSinglePassAnalysis(
+        sessionId: String,
+        speakers: List<SessionSpeakerEntity>,
+        replaceSentences: Boolean,
+        sentences: List<TranscriptSentenceEntity>,
+        replaceStructuredData: Boolean,
+        patients: List<PatientBlockEntity>,
+        items: List<ItemEntity>,
+        mode: SessionMode,
+        roundGroupId: String?,
+        eventGroupId: String?,
+        context: String?,
+        title: String?,
+        summary: String?,
+        keyPointsJson: String?,
+        aiReviewReport: String?,
+        reviewedAtMs: Long,
+        reviewSourceMode: String?
+    ): Boolean {
+        if (getSessionById(sessionId) == null) return false
+        if (speakers.isNotEmpty()) {
+            deleteSpeakersForSession(sessionId)
+            insertSpeakers(speakers)
+        }
+        if (replaceSentences) {
+            deleteSentencesForSession(sessionId)
+            if (sentences.isNotEmpty()) {
+                insertSentences(sentences)
+            }
+        }
+        if (replaceStructuredData) {
+            deletePatientsForSession(sessionId)
+            if (patients.isNotEmpty()) {
+                insertPatients(patients)
+            }
+            deleteItemsForSession(sessionId)
+            if (items.isNotEmpty()) {
+                insertItems(items)
+            }
+        }
+        updateSessionCompletedWithReviewFields(
+            sessionId = sessionId,
+            mode = mode,
+            roundGroupId = roundGroupId,
+            eventGroupId = eventGroupId,
+            context = context,
+            title = title,
+            summary = summary,
+            keyPointsJson = keyPointsJson,
+            aiReviewReport = aiReviewReport,
+            reviewedAtMs = reviewedAtMs,
+            reviewSourceMode = reviewSourceMode
+        )
+        return true
+    }
+
+    /**
+     * Atomically persists `AI_REVIEW_EXTRACTED_ONLY` results while preserving existing single-session
+     * transcripts and refreshing combined-session stitched transcripts when requested.
+     * Returns `false` if the session was deleted before commit.
+     */
+    @Transaction
+    suspend fun persistExtractedInfoReview(
+        sessionId: String,
+        speakers: List<SessionSpeakerEntity>,
+        replaceSentences: Boolean,
+        sentences: List<TranscriptSentenceEntity>,
+        patients: List<PatientBlockEntity>,
+        items: List<ItemEntity>,
+        mode: SessionMode,
+        roundGroupId: String?,
+        eventGroupId: String?,
+        context: String?,
+        title: String?,
+        summary: String?,
+        keyPointsJson: String?,
+        aiReviewReport: String?,
+        reviewedAtMs: Long,
+        reviewSourceMode: String?
+    ): Boolean {
+        if (getSessionById(sessionId) == null) return false
+        if (speakers.isNotEmpty()) {
+            deleteSpeakersForSession(sessionId)
+            insertSpeakers(speakers)
+        }
+        if (replaceSentences) {
+            deleteSentencesForSession(sessionId)
+            if (sentences.isNotEmpty()) {
+                insertSentences(sentences)
+            }
+        }
+        deletePatientsForSession(sessionId)
+        if (patients.isNotEmpty()) {
+            insertPatients(patients)
+        }
+        deleteItemsForSession(sessionId)
+        if (items.isNotEmpty()) {
+            insertItems(items)
+        }
+        updateSessionCompletedWithReviewFields(
+            sessionId = sessionId,
+            mode = mode,
+            roundGroupId = roundGroupId,
+            eventGroupId = eventGroupId,
+            context = context,
+            title = title,
+            summary = summary,
+            keyPointsJson = keyPointsJson,
+            aiReviewReport = aiReviewReport,
+            reviewedAtMs = reviewedAtMs,
+            reviewSourceMode = reviewSourceMode
+        )
+        return true
     }
 
     @Transaction
