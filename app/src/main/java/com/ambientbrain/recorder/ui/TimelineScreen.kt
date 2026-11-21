@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Merge
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Refresh
@@ -389,7 +390,39 @@ fun TimelineScreen(
                             )
                         }
 
-                        val isFailed = s.status == Status.FAILED_RETRYABLE || s.status == Status.FAILED_PERMANENT || !s.lastError.isNullOrBlank()
+                        val isFailed = s.status == Status.FAILED_RETRYABLE ||
+                            s.status == Status.FAILED_PERMANENT ||
+                            (!s.lastError.isNullOrBlank() && s.status != Status.DONE)
+                        if (s.status == Status.DONE && !s.lastError.isNullOrBlank()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Card(
+                                shape = RoundedCornerShape(10.dp),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f)
+                                ),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(10.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Info,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.secondary,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = s.lastError,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+                        }
                         if (isFailed) {
                             val minLeft = if (s.nextRetryEpochMs > System.currentTimeMillis()) {
                                 ((s.nextRetryEpochMs - System.currentTimeMillis() + 59_999L) / 60_000L).coerceAtLeast(1L)
