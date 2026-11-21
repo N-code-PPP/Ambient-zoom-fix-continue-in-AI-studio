@@ -313,6 +313,28 @@ data class GlossaryTermEntry(
     }
 }
 
+enum class TwoStagePipelineMode(
+    val label: String,
+    val shortDesc: String
+) {
+    AUTO_40S(
+        label = "Auto (≥ 40s / Multi-Batch)",
+        shortDesc = "Transcribe first → checkpoint → deep analysis for ≥ 40s or split recordings; 1-pass for short < 40s clips."
+    ),
+    ALWAYS(
+        label = "Always 2-Stage (N+1)",
+        shortDesc = "Always transcribe verbatim first, save checkpoint, then analyze full transcript for every meaningful clip."
+    ),
+    MULTI_BATCH_ONLY(
+        label = "Multi-Batch Only",
+        shortDesc = "Use 2-stage only when long audio splits into multiple batches; single-batch recordings stay 1-pass."
+    ),
+    SINGLE_PASS(
+        label = "Single-Pass Direct",
+        shortDesc = "Classic 1-pass direct audio analysis without automatic verbatim transcription."
+    )
+}
+
 @Serializable
 data class SettingsBackupPayload(
     val format: String = "ambient_brain_settings_v1",
@@ -323,6 +345,7 @@ data class SettingsBackupPayload(
     val geminiModel: String = PreferencesRepo.DEFAULT_MODEL,
     val fallbackGeminiModel: String = PreferencesRepo.DEFAULT_FALLBACK_MODEL,
     val transcriptLangMode: String = TranscriptLangMode.BILINGUAL_TH_EN.name,
+    val twoStagePipelineMode: String = TwoStagePipelineMode.AUTO_40S.name,
     val autoDetectRounds: Boolean = true,
     val autoRecognizeVoiceProfiles: Boolean = true,
     val autoAddGlossaryTerms: Boolean = true,
@@ -486,6 +509,14 @@ class PreferencesRepo(private val context: Context) {
                 .getOrDefault(TranscriptLangMode.BILINGUAL_TH_EN)
         }
         set(value) = prefs.edit().putString(KEY_TRANSCRIPT_LANG_MODE, value.name).apply()
+
+    var twoStagePipelineMode: TwoStagePipelineMode
+        get() {
+            val name = prefs.getString(KEY_TWO_STAGE_PIPELINE_MODE, TwoStagePipelineMode.AUTO_40S.name)
+            return runCatching { TwoStagePipelineMode.valueOf(name!!) }
+                .getOrDefault(TwoStagePipelineMode.AUTO_40S)
+        }
+        set(value) = prefs.edit().putString(KEY_TWO_STAGE_PIPELINE_MODE, value.name).apply()
 
     var autoDetectRounds: Boolean
         get() = prefs.getBoolean(KEY_AUTO_DETECT_ROUNDS, true)
@@ -1715,6 +1746,7 @@ class PreferencesRepo(private val context: Context) {
             geminiModel = geminiModel,
             fallbackGeminiModel = fallbackGeminiModel,
             transcriptLangMode = transcriptLangMode.name,
+            twoStagePipelineMode = twoStagePipelineMode.name,
             autoDetectRounds = autoDetectRounds,
             autoRecognizeVoiceProfiles = autoRecognizeVoiceProfiles,
             autoAddGlossaryTerms = autoAddGlossaryTerms,
@@ -1770,6 +1802,9 @@ class PreferencesRepo(private val context: Context) {
         transcriptLangMode = runCatching {
             TranscriptLangMode.valueOf(payload.transcriptLangMode)
         }.getOrDefault(TranscriptLangMode.BILINGUAL_TH_EN)
+        twoStagePipelineMode = runCatching {
+            TwoStagePipelineMode.valueOf(payload.twoStagePipelineMode)
+        }.getOrDefault(TwoStagePipelineMode.AUTO_40S)
         autoDetectRounds = payload.autoDetectRounds
         autoRecognizeVoiceProfiles = payload.autoRecognizeVoiceProfiles
         autoAddGlossaryTerms = payload.autoAddGlossaryTerms
@@ -2155,6 +2190,7 @@ class PreferencesRepo(private val context: Context) {
         private const val KEY_FALLBACK_MODEL = "gemini_fallback_model"
         private const val KEY_MODEL_ALLOWANCE_CACHE = "model_allowance_cache_json"
         private const val KEY_TRANSCRIPT_LANG_MODE = "transcript_lang_mode"
+        private const val KEY_TWO_STAGE_PIPELINE_MODE = "two_stage_pipeline_mode"
         private const val KEY_AUTO_DETECT_ROUNDS = "auto_detect_rounds"
         private const val KEY_AUTO_RECOGNIZE_VOICE_PROFILES = "auto_recognize_voice_profiles"
         private const val KEY_MIN_MEANINGFUL_SPEECH_SEC = "min_meaningful_speech_sec"

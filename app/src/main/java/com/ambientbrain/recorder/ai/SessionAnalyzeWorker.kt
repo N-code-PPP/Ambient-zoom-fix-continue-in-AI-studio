@@ -21,8 +21,10 @@ import com.ambientbrain.recorder.data.PreferencesRepo
 import com.ambientbrain.recorder.data.SegmentMapEntity
 import com.ambientbrain.recorder.data.SessionEntity
 import com.ambientbrain.recorder.data.SessionMode
+import com.ambientbrain.recorder.data.SessionSpeakerEntity
 import com.ambientbrain.recorder.data.Status
 import com.ambientbrain.recorder.data.TranscriptSentenceEntity
+import com.ambientbrain.recorder.data.TwoStagePipelineMode
 import com.ambientbrain.recorder.service.CaptureEngineController
 import com.ambientbrain.recorder.service.MeetingAudioCaptureMode
 import com.ambientbrain.recorder.service.MeetingMetadataHelper
@@ -104,6 +106,7 @@ class SessionAnalyzeWorker(
         val modeStr = inputData.getString(KEY_ANALYSIS_MODE) ?: AnalysisMode.INFO_EXTRACTION_EN.name
         val analysisMode = runCatching { AnalysisMode.valueOf(modeStr) }
             .getOrDefault(AnalysisMode.INFO_EXTRACTION_EN)
+        val forceFreshAudio = inputData.getBoolean(KEY_FORCE_FRESH_AUDIO, false)
         val session = db.getSessionById(sessionId) ?: return Result.failure()
 
         // Respect temporary Gemini AI pause immediately before doing any cloud work
@@ -168,20 +171,55 @@ class SessionAnalyzeWorker(
             }
         }
 
-        if (validAudioSources.isEmpty()) {
-            if (excludedMeetingInternalAudioCount > 0) {
-                db.upsertSession(
-                    session.copy(
-                        status = Status.DONE,
-                        summary = session.summary?.takeIf { it.isNotBlank() }
-                            ?: "$excludedPlatformLabel meeting saved locally. Internal app audio was excluded from Gemini.",
-                        retryCount = 0,
-                        nextRetryEpochMs = 0L,
-                        lastError = null
-                    )
+        if (validAudioSources.isEmpty() && excludedMeetingInternalAudioCount > 0) {
+            db.upsertSession(
+                session.copy(
+                    status = Status.DONE,
+                    summary = session.summary?.takeIf {
+                        it.isNotBlank() && it != STAGE1_TRANSCRIPT_CHECKPOINT_MARKER
+                    } ?: "$excludedPlatformLabel meeting saved locally. Internal app audio was excluded from Gemini.",
+                    retryCount = 0,
+                    nextRetryEpochMs = 0L,
+                    lastError = null
                 )
-                return Result.success()
+            )
+            return Result.success()
+        }
+
+        // Fast-path Stage 2 text-only resume when Stage 1 transcript was already checkpointed in Room.
+        // Skips all audio chunking, pre-Gemini voice scan, and audio re-upload unless the user
+        // explicitly tapped manual Re-analyze (`forceFreshAudio = true`).
+        if (analysisMode == AnalysisMode.INFO_EXTRACTION_EN &&
+            !forceFreshAudio &&
+            session.summary == STAGE1_TRANSCRIPT_CHECKPOINT_MARKER
+        ) {
+            val checkpointDetails = db.getSessionWithDetailsOnce(sessionId)
+            if (checkpointDetails != null && checkpointDetails.sentences.isNotEmpty()) {
+                Log.i(
+                    TAG,
+                    "Resuming Stage 2 text-only synthesis from saved Room transcript checkpoint for $sessionId (${checkpointDetails.sentences.size} lines; zero audio re-upload)"
+                )
+                db.upsertSession(session.copy(status = Status.ANALYZING, lastError = null))
+                val lightweightParts = buildLightweightIndexedParts(validAudioSources)
+                val (resolvedEventGroupId, priorEventContextText, priorItemsToAvoid) =
+                    resolveEventGroupAndPriorContext(session, combinedIds, analysisMode)
+                return runTwoStageTextSynthesis(
+                    session = session.copy(eventGroupId = resolvedEventGroupId, status = Status.ANALYZING, lastError = null),
+                    sourceSessions = sourceSessions,
+                    validAudioSources = validAudioSources,
+                    indexedParts = lightweightParts,
+                    combinedIds = combinedIds,
+                    resolvedEventGroupId = resolvedEventGroupId,
+                    priorEventContextText = priorEventContextText,
+                    priorItemsToAvoid = priorItemsToAvoid,
+                    savedSpeakers = checkpointDetails.speakers,
+                    savedSentences = checkpointDetails.sentences,
+                    shouldIgnoreMeetingInternalAudio = shouldIgnoreMeetingInternalAudio
+                )
             }
+        }
+
+        if (validAudioSources.isEmpty()) {
             db.upsertSession(
                 session.copy(
                     status = Status.FAILED_PERMANENT,
@@ -337,6 +375,25 @@ class SessionAnalyzeWorker(
 
             // Group indexed parts into batches that fit safely within Priority 1 inline payload budget
             val batches = groupPartsIntoBatches(indexedParts, maxAudioBatchBytes)
+            val totalAudioDurationMs = indexedParts.sumOf { it.durationMs }
+            val useTwoStagePipeline = analysisMode == AnalysisMode.INFO_EXTRACTION_EN && when (prefs.twoStagePipelineMode) {
+                TwoStagePipelineMode.AUTO_40S -> totalAudioDurationMs >= AUTO_TWO_STAGE_DURATION_MS || batches.size > 1
+                TwoStagePipelineMode.ALWAYS -> true
+                TwoStagePipelineMode.MULTI_BATCH_ONLY -> batches.size > 1
+                TwoStagePipelineMode.SINGLE_PASS -> false
+            }
+            val effectiveAudioPassMode = if (useTwoStagePipeline) {
+                AnalysisMode.VERBATIM_ORIGINAL_TRANSCRIPT
+            } else {
+                analysisMode
+            }
+            if (useTwoStagePipeline) {
+                Log.i(
+                    TAG,
+                    "Two-Stage Pipeline active for $sessionId (mode=${prefs.twoStagePipelineMode.name}, dur=${totalAudioDurationMs / 1000L}s, batches=${batches.size}): Stage 1 Transcribe -> Room Checkpoint -> Stage 2 Synthesize"
+                )
+            }
+
             val batchResponses = mutableListOf<Pair<List<IndexedAudioPart>, GeminiCallResponse>>()
             var rollingChunkContext = priorEventContextText
             var totalInTokens = 0
@@ -375,7 +432,7 @@ class SessionAnalyzeWorker(
                     sessionIsoTime = isoTime,
                     isManualRound = sourceSessions.any { it.mode == SessionMode.ROUND_MANUAL },
                     callEventsJson = sourceSessions.mapNotNull { it.callEventsJson }.firstOrNull(),
-                    analysisMode = analysisMode,
+                    analysisMode = effectiveAudioPassMode,
                     priorEventContextText = rollingChunkContext,
                     multiAudioClipDescriptions = multiDescriptions,
                     chunkHeaderText = chunkHeader,
@@ -404,24 +461,40 @@ class SessionAnalyzeWorker(
                 totalCachedTokens += callResponse.cachedTokens
                 totalLatencyMs += callResponse.latencyMs
 
-                // Roll speaker & summary continuity forward into the next batch if there are multiple batches
+                // Roll speaker & tail dialogue/summary continuity forward into the next batch if there are multiple batches
                 if (batchIdx < batches.size - 1) {
                     val res = callResponse.analysis
-                    val batchSpeakers = res.speakers.joinToString(", ") { it.speakerLabel }
+                    val batchSpeakers = res.speakers.joinToString(", ") { spk ->
+                        "${spk.speakerId}=${spk.speakerLabel}"
+                    }
+                    val tailDialogue = res.transcript.takeLast(6).joinToString("\n") { line ->
+                        "  [${line.t}] ${line.speakerLabel}: ${line.textOriginal.take(160)}"
+                    }
                     rollingChunkContext = buildString {
                         if (priorEventContextText.isNotBlank()) appendLine(priorEventContextText.take(400))
                         appendLine("Earlier in this same continuous session (Batch ${batchIdx + 1}/${batches.size}):")
-                        if (batchSpeakers.isNotBlank()) appendLine("- Identified Speakers: $batchSpeakers")
-                        if (res.summary.isNotBlank()) appendLine("- Earlier Context: ${res.summary.take(700)}")
+                        if (batchSpeakers.isNotBlank()) appendLine("- Identified Speakers (keep speaker_id & speaker_label consistent): $batchSpeakers")
+                        if (tailDialogue.isNotBlank()) {
+                            appendLine("- Last Verbatim Lines Before This Batch:")
+                            appendLine(tailDialogue)
+                        } else if (res.summary.isNotBlank()) {
+                            appendLine("- Earlier Context: ${res.summary.take(700)}")
+                        }
                     }.trim()
                 }
+            }
+
+            val audioRunPromptVersion = if (useTwoStagePipeline) {
+                "${Prompts.PROMPT_VERSION}:TWO_STAGE_S1_TRANSCRIBE"
+            } else {
+                "${Prompts.PROMPT_VERSION}:${analysisMode.name}"
             }
 
             db.insertAnalysisRun(
                 AnalysisRunEntity(
                     sessionId = sessionId,
                     model = usedRouteLabel,
-                    promptVersion = "${Prompts.PROMPT_VERSION}:${analysisMode.name}",
+                    promptVersion = audioRunPromptVersion,
                     inTokens = totalInTokens,
                     outTokens = totalOutTokens,
                     cachedTokens = totalCachedTokens,
@@ -429,6 +502,136 @@ class SessionAnalyzeWorker(
                     ok = true
                 )
             )
+
+            // === TWO-STAGE PIPELINE CHECKPOINT & STAGE 2 SYNTHESIS ===
+            if (useTwoStagePipeline) {
+                val stage1Merged = mergeBatchResponses(batchResponses, AnalysisMode.VERBATIM_ORIGINAL_TRANSCRIPT)
+                if (!stage1Merged.hasMeaningfulContent && stage1Merged.transcript.isEmpty()) {
+                    db.upsertSession(
+                        session.copy(
+                            rawPath = session.rawPath?.takeIf { File(it).exists() } ?: validAudioSources.first().second.absolutePath,
+                            rawBytes = session.rawPath?.let { File(it) }?.takeIf { it.exists() }?.length()
+                                ?: validAudioSources.sumOf { it.second.length() },
+                            isRawPurged = false,
+                            eventGroupId = resolvedEventGroupId,
+                            context = if (shouldIgnoreMeetingInternalAudio) {
+                                session.context ?: "ONLINE_MEETING"
+                            } else {
+                                "NOISE_OR_TV"
+                            },
+                            title = if (shouldIgnoreMeetingInternalAudio) {
+                                session.title?.takeIf { it.isNotBlank() } ?: "$excludedPlatformLabel Meeting"
+                            } else {
+                                "Ambient / Unclassified Audio"
+                            },
+                            summary = if (shouldIgnoreMeetingInternalAudio) {
+                                "$excludedPlatformLabel meeting saved locally (internal app audio ignored by Gemini; no separate local speech detected)."
+                            } else {
+                                "Background audio or unclassified conversation."
+                            },
+                            status = Status.DONE,
+                            retryCount = 0,
+                            nextRetryEpochMs = 0L,
+                            lastError = null
+                        )
+                    )
+                    Log.i(TAG, "Two-Stage S1 early exit (no meaningful speech) for $sessionId; Stage 2 skipped.")
+                    return Result.success()
+                }
+
+                // Reconcile speakers + slice clean solo voice samples during Stage 1 while audio chunks are ready
+                val sliceSources = indexedParts.map { part ->
+                    VoiceProfileAutoManager.SliceSourceSegment(
+                        file = part.file,
+                        globalOffsetMs = part.globalOffsetMs,
+                        durationMs = part.durationMs,
+                        segments = part.segments,
+                        sourceStartMs = part.sourceStartMs
+                    )
+                }
+                val reconciledS1 = VoiceProfileAutoManager.reconcileAndEnrollSpeakers(
+                    context = applicationContext,
+                    prefs = prefs,
+                    sessionId = sessionId,
+                    sessionContext = stage1Merged.context,
+                    sliceSources = sliceSources,
+                    rawSpeakers = stage1Merged.speakers,
+                    rawTranscript = stage1Merged.transcript,
+                    rawItems = emptyList(),
+                    allowSlicing = true,
+                    sessionRecordedAtMs = sourceSessions.first().startMs
+                )
+                if (reconciledS1.speakers.isNotEmpty()) {
+                    db.deleteSpeakersForSession(sessionId)
+                    db.insertSpeakers(reconciledS1.speakers)
+                }
+
+                // Save complete merged Stage 1 verbatim transcript to Room immediately
+                val stage1Sentences = stage1Merged.transcript.mapIndexed { idx, sent ->
+                    val rawGlobalMs = ClipSlicer.parseApproxMmSsToMs(sent.t)
+                    val mappedPart = findPartForGlobalOffset(indexedParts, rawGlobalMs)
+                    val localOffsetMs = (rawGlobalMs - mappedPart.globalOffsetMs).coerceAtLeast(0L)
+                    val resolved = ClipSlicer.resolveCompactedTimestamp(
+                        rawInputMs = localOffsetMs,
+                        segments = mappedPart.segments,
+                        sessionStartMs = mappedPart.sourceStartMs,
+                        maxFileDurationMs = mappedPart.durationMs
+                    )
+                    val wallRelativeMs = (resolved.wallClockMs - sourceSessions.first().startMs)
+                        .coerceAtLeast(rawGlobalMs)
+                    val resolvedSpeakerLabel = reconciledS1.speakerLabelById[sent.speakerId] ?: sent.speakerLabel
+                    TranscriptSentenceEntity(
+                        sentenceUuid = UUID.randomUUID().toString(),
+                        sessionId = sessionId,
+                        ordinal = idx,
+                        approxMs = if (indexedParts.size == 1 && mappedPart.segments.isEmpty()) resolved.rawFileMs else wallRelativeMs,
+                        speakerId = sent.speakerId,
+                        speakerLabel = resolvedSpeakerLabel,
+                        textOriginal = sent.textOriginal,
+                        textEn = sent.textEn
+                    )
+                }
+                db.deleteSentencesForSession(sessionId)
+                if (stage1Sentences.isNotEmpty()) {
+                    db.insertSentences(stage1Sentences)
+                }
+
+                // Commit Stage 1 checkpoint marker so any pause or Stage 2 failure retries text-only without re-uploading audio
+                val checkpointSession = session.copy(
+                    eventGroupId = resolvedEventGroupId,
+                    title = stage1Merged.title.takeIf {
+                        it.isNotBlank() && !it.contains("Ambient / Unclassified", ignoreCase = true)
+                    } ?: session.title,
+                    summary = STAGE1_TRANSCRIPT_CHECKPOINT_MARKER,
+                    status = Status.ANALYZING,
+                    retryCount = 0,
+                    nextRetryEpochMs = 0L,
+                    lastError = null
+                )
+                db.upsertSession(checkpointSession)
+                Log.i(
+                    TAG,
+                    "Two-Stage S1 checkpoint saved for $sessionId (speakers=${reconciledS1.speakers.size}, lines=${stage1Sentences.size}, route=$usedRouteLabel). Proceeding to Stage 2 text-only synthesis..."
+                )
+
+                if (prefs.isGeminiUsagePausedNow()) {
+                    return handlePausedSession(checkpointSession, AnalysisMode.INFO_EXTRACTION_EN)
+                }
+
+                return runTwoStageTextSynthesis(
+                    session = checkpointSession,
+                    sourceSessions = sourceSessions,
+                    validAudioSources = validAudioSources,
+                    indexedParts = indexedParts,
+                    combinedIds = combinedIds,
+                    resolvedEventGroupId = resolvedEventGroupId,
+                    priorEventContextText = priorEventContextText,
+                    priorItemsToAvoid = priorItemsToAvoid,
+                    savedSpeakers = reconciledS1.speakers,
+                    savedSentences = stage1Sentences,
+                    shouldIgnoreMeetingInternalAudio = shouldIgnoreMeetingInternalAudio
+                )
+            }
 
             // Merge batch responses into a unified result with corrected offsets,
             // plan-to-task reconciliation, and fuzzy deduplication of tasks & key points
@@ -710,7 +913,8 @@ class SessionAnalyzeWorker(
             // 5. Mark Session DONE — strictly preserve Pass 1 summary/keyPoints when Pass 2 is Verbatim-Only
             val hasExistingRichInfo = !session.summary.isNullOrBlank() &&
                 session.context != "NOISE_OR_TV" &&
-                session.summary != "100% verbatim transcript completed"
+                session.summary != "100% verbatim transcript completed" &&
+                session.summary != STAGE1_TRANSCRIPT_CHECKPOINT_MARKER
 
             val effectiveTitle = when {
                 analysisMode == AnalysisMode.VERBATIM_ORIGINAL_TRANSCRIPT &&
@@ -933,6 +1137,547 @@ class SessionAnalyzeWorker(
                     if (dir.name.startsWith(sessionId)) dir.deleteRecursively()
                 }
             }
+        }
+    }
+
+    private suspend fun buildLightweightIndexedParts(
+        validAudioSources: List<Pair<SessionEntity, File>>
+    ): List<IndexedAudioPart> {
+        val parts = mutableListOf<IndexedAudioPart>()
+        var cumulativeOffsetMs = 0L
+        validAudioSources.forEachIndexed { clipIdx, (srcSession, srcFile) ->
+            val srcSegments = db.getSegmentMapForSession(srcSession.id)
+            val durationMs = ClipSlicer.estimateAdtsDurationMs(srcFile).coerceAtLeast(1_000L)
+            val timeLabel = Instant.ofEpochMilli(srcSession.startMs)
+                .atZone(ZoneId.systemDefault())
+                .format(DateTimeFormatter.ofPattern("HH:mm"))
+            val label = if (validAudioSources.size > 1) {
+                "Recording #${clipIdx + 1} ($timeLabel)"
+            } else {
+                "Session Recording ($timeLabel)"
+            }
+            parts.add(
+                IndexedAudioPart(
+                    sessionId = srcSession.id,
+                    label = label,
+                    file = srcFile,
+                    globalOffsetMs = cumulativeOffsetMs,
+                    durationMs = durationMs,
+                    sourceStartMs = srcSession.startMs,
+                    segments = srcSegments,
+                    isTemporaryChunk = false
+                )
+            )
+            cumulativeOffsetMs += durationMs
+        }
+        return parts
+    }
+
+    private suspend fun resolveEventGroupAndPriorContext(
+        session: SessionEntity,
+        combinedIds: List<String>,
+        analysisMode: AnalysisMode
+    ): Triple<String?, String, List<Pair<String, String>>> {
+        val sessionId = session.id
+        var resolvedEventGroupId = session.eventGroupId ?: session.roundGroupId
+        if (combinedIds.isEmpty() && resolvedEventGroupId == null) {
+            val fifteenMinAgo = session.startMs - TimeUnit.MINUTES.toMillis(15)
+            val recentEvent = db.findRecentSessionForEventGroup(fifteenMinAgo, sessionId)
+            resolvedEventGroupId = recentEvent?.eventGroupId ?: recentEvent?.roundGroupId ?: recentEvent?.id ?: sessionId
+            if (recentEvent != null && recentEvent.eventGroupId == null) {
+                db.updateSessionEventGroup(recentEvent.id, resolvedEventGroupId)
+            }
+        }
+        val priorItemsToAvoid = mutableListOf<Pair<String, String>>()
+        val priorEventContextText = if (combinedIds.isEmpty() && !resolvedEventGroupId.isNullOrBlank()) {
+            val priorSessions = db.findPriorContextSessionsInGroup(
+                groupId = resolvedEventGroupId,
+                beforeStartMs = session.startMs,
+                excludeSessionId = sessionId
+            ).sortedBy { it.session.startMs }
+            if (priorSessions.isNotEmpty()) {
+                buildString {
+                    priorSessions.forEachIndexed { idx, prior ->
+                        val timeStr = Instant.ofEpochMilli(prior.session.startMs)
+                            .atZone(ZoneId.systemDefault())
+                            .format(DateTimeFormatter.ofPattern("HH:mm"))
+                        appendLine("Prior Segment ${idx + 1} ($timeStr • ${prior.session.title ?: "Session"}):")
+                        if (prior.speakers.isNotEmpty()) {
+                            val spkList = prior.speakers.joinToString(", ") { s ->
+                                if (!s.inferredRole.isNullOrBlank()) "${s.speakerLabel} (${s.inferredRole})" else s.speakerLabel
+                            }
+                            appendLine("  Speakers identified: $spkList")
+                        }
+                        if (prior.patients.isNotEmpty()) {
+                            appendLine("  Patients discussed: ${prior.patients.joinToString(", ") { it.patientIdentifier }}")
+                        }
+                        if (prior.items.isNotEmpty()) {
+                            prior.items.forEach { pi ->
+                                priorItemsToAvoid.add(pi.patientIdentifier.orEmpty() to pi.title)
+                            }
+                            val itemBriefs = prior.items.take(8).joinToString("; ") { pi ->
+                                val pat = pi.patientIdentifier?.let { "[$it] " }.orEmpty()
+                                "$pat${pi.title}"
+                            }
+                            appendLine("  Already Captured Action Items: $itemBriefs")
+                        }
+                        if (!prior.session.summary.isNullOrBlank() &&
+                            prior.session.summary != STAGE1_TRANSCRIPT_CHECKPOINT_MARKER
+                        ) {
+                            appendLine("  Key Prior Context: ${prior.session.summary.take(700)}")
+                        }
+                    }
+                }.trim()
+            } else ""
+        } else if (analysisMode == AnalysisMode.AI_REVIEW_FROM_AUDIO) {
+            val existingIds = if (combinedIds.isNotEmpty()) combinedIds else listOf(sessionId)
+            val existingSources = db.getSessionsWithDetailsByIds(existingIds)
+            if (existingSources.any { ContinuousMergePlanner.hasExtractedInfo(it) }) {
+                Prompts.buildExtractedInfoInputDocument(existingSources).take(5500)
+            } else ""
+        } else ""
+        return Triple(resolvedEventGroupId, priorEventContextText, priorItemsToAvoid)
+    }
+
+    /**
+     * Stage 2 of the Two-Stage Transcribe-then-Analyze pipeline:
+     * Sends the complete merged verbatim diarized transcript from Room as a single text-only call
+     * via the same Primary model (and Fallback policy) rotated across the API Key Pool.
+     * Preserves Stage 1 transcript rows verbatim while writing unified summary, unlimited detailed
+     * key points, reconciled patients, final-state items with voice-proof clips, and retroactive
+     * speaker name upgrades.
+     */
+    private suspend fun runTwoStageTextSynthesis(
+        session: SessionEntity,
+        sourceSessions: List<SessionEntity>,
+        validAudioSources: List<Pair<SessionEntity, File>>,
+        indexedParts: List<IndexedAudioPart>,
+        combinedIds: List<String>,
+        resolvedEventGroupId: String?,
+        priorEventContextText: String,
+        priorItemsToAvoid: List<Pair<String, String>>,
+        savedSpeakers: List<SessionSpeakerEntity>,
+        savedSentences: List<TranscriptSentenceEntity>,
+        shouldIgnoreMeetingInternalAudio: Boolean
+    ): Result {
+        val sessionId = session.id
+        return try {
+            val glossaryText = Prompts.loadGlossaryPromptText(applicationContext, prefs)
+            val systemInstruction = Prompts.buildStaticSystemInstruction(
+                userDisplayName = prefs.userDisplayName,
+                transcriptLangMode = prefs.transcriptLangMode,
+                hasVoiceProfile = prefs.hasMyVoiceProfile(),
+                speakerRoster = prefs.getSpeakerRoster(),
+                attachedVoiceLabels = emptyList(),
+                glossaryText = glossaryText,
+                attachedVoiceProfiles = emptyList()
+            )
+
+            val firstSourceStartMs = sourceSessions.firstOrNull()?.startMs ?: session.startMs
+            val isoTime = Instant.ofEpochMilli(firstSourceStartMs)
+                .atZone(ZoneId.systemDefault())
+                .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+
+            val multiDescriptions = if (validAudioSources.size > 1) {
+                validAudioSources.mapIndexed { idx, (s, _) ->
+                    val t = Instant.ofEpochMilli(s.startMs).atZone(ZoneId.systemDefault())
+                        .format(DateTimeFormatter.ofPattern("HH:mm:ss"))
+                    "Clip #${idx + 1}: started $t, title='${s.title ?: "Recording"}'"
+                }
+            } else emptyList()
+
+            val sessionContextText = Prompts.buildDynamicSessionContextText(
+                sessionIsoTime = isoTime,
+                isManualRound = sourceSessions.any { it.mode == SessionMode.ROUND_MANUAL },
+                callEventsJson = sourceSessions.mapNotNull { it.callEventsJson }.firstOrNull(),
+                analysisMode = AnalysisMode.TWO_STAGE_SYNTHESIS_FROM_TRANSCRIPT,
+                priorEventContextText = priorEventContextText,
+                multiAudioClipDescriptions = multiDescriptions,
+                ignoreMeetingInternalAudio = shouldIgnoreMeetingInternalAudio
+            )
+
+            val mergedTranscriptDoc = Prompts.buildMergedTranscriptDocument(
+                session = session,
+                speakers = savedSpeakers,
+                sentences = savedSentences,
+                priorEventContextText = priorEventContextText
+            )
+
+            val (callResponse, usedRouteLabel) = executeKeyPoolExtractedReviewCall(
+                sessionId = sessionId,
+                systemInstruction = systemInstruction,
+                sessionContextText = sessionContextText,
+                extractedDocument = mergedTranscriptDoc
+            )
+
+            db.insertAnalysisRun(
+                AnalysisRunEntity(
+                    sessionId = sessionId,
+                    model = usedRouteLabel,
+                    promptVersion = "${Prompts.PROMPT_VERSION}:TWO_STAGE_S2_SYNTHESIS",
+                    inTokens = callResponse.inputTokens,
+                    outTokens = callResponse.outputTokens,
+                    cachedTokens = callResponse.cachedTokens,
+                    latencyMs = callResponse.latencyMs,
+                    ok = true
+                )
+            )
+
+            val rawRes = callResponse.analysis
+            val mergedPatients = ExtractionRefiner.mergePatients(rawRes.patients)
+            val reconciledItems = ExtractionRefiner.synthesizeMissingPlanTasks(mergedPatients, rawRes.items)
+            val refinedItems = ExtractionRefiner.deduplicateAndEnrichItems(
+                rawItems = reconciledItems,
+                userDisplayName = prefs.userDisplayName,
+                priorItemsToAvoid = priorItemsToAvoid
+            )
+            val refinedKeyPoints = ExtractionRefiner.refineKeyPoints(
+                rawKeyPoints = rawRes.keyPoints,
+                patients = mergedPatients,
+                items = refinedItems
+            )
+
+            // Auto-detect clinical round & stitch roundGroupId
+            val isRoundDetected = session.mode == SessionMode.ROUND_MANUAL ||
+                session.mode == SessionMode.ROUND_AUTO ||
+                (prefs.autoDetectRounds && (
+                    rawRes.isClinicalRound ||
+                        rawRes.context in setOf("NEURO_ROUND", "MEDICAL_ROUND", "CASE_CONFERENCE", "HANDOVER") ||
+                        mergedPatients.isNotEmpty()
+                    ))
+
+            var finalMode = session.mode
+            var finalRoundGroupId = session.roundGroupId
+            if (isRoundDetected) {
+                if (finalMode == SessionMode.EVERYDAY) {
+                    finalMode = SessionMode.ROUND_AUTO
+                }
+                if (finalRoundGroupId == null) {
+                    val thirtyMinAgo = session.startMs - TimeUnit.MINUTES.toMillis(30)
+                    val recentRound = db.findRecentRoundSessionSince(thirtyMinAgo, sessionId)
+                    finalRoundGroupId = recentRound?.roundGroupId ?: recentRound?.id ?: resolvedEventGroupId ?: sessionId
+                    if (recentRound != null && recentRound.roundGroupId == null) {
+                        db.updateSessionRoundGroup(recentRound.id, recentRound.mode, finalRoundGroupId)
+                        db.updatePatientsRoundGroup(recentRound.id, finalRoundGroupId)
+                    }
+                }
+                if (combinedIds.isEmpty() && System.currentTimeMillis() - session.endMs < TimeUnit.MINUTES.toMillis(3)) {
+                    CaptureEngineController.promoteActiveCaptureToAutoRound(finalRoundGroupId)
+                }
+            }
+
+            // Retroactively unify speaker names/titles discovered in Stage 2 across speakers & sentences
+            // without touching Stage 1 transcript text or voice samples.
+            val speakerLabelById = savedSpeakers.associate { it.speakerId to it.speakerLabel }.toMutableMap()
+            val existingById = savedSpeakers.associateBy { it.speakerId }
+            val speakerNamesToIgnore = mutableSetOf<String>()
+            savedSpeakers.forEach { spk ->
+                spk.nickname?.let { speakerNamesToIgnore.add(it) }
+                speakerNamesToIgnore.add(spk.speakerLabel)
+            }
+            for (s2Spk in rawRes.speakers) {
+                val existing = existingById[s2Spk.speakerId] ?: continue
+                val newLabel = s2Spk.speakerLabel.trim()
+                val isGeneric = newLabel.isBlank() ||
+                    newLabel.startsWith("Speaker ", ignoreCase = true) ||
+                    newLabel.equals("Unknown", ignoreCase = true)
+                if (!isGeneric && !newLabel.equals(existing.speakerLabel, ignoreCase = true)) {
+                    val newNick = s2Spk.nickname.trim().ifBlank { existing.nickname }
+                    val newTitle = s2Spk.relatableTitle.trim().ifBlank { existing.relatableTitle }
+                    val newVoiceSig = s2Spk.voiceSignature.trim().ifBlank { existing.voiceSignature }
+                    db.renameSpeakerProfileAcrossSession(
+                        sessionId = sessionId,
+                        speakerId = existing.speakerId,
+                        newLabel = newLabel,
+                        matchedProfileId = existing.matchedProfileId ?: s2Spk.matchedProfileId?.takeIf { it.isNotBlank() },
+                        nickname = newNick,
+                        relatableTitle = newTitle,
+                        voiceSignature = newVoiceSig,
+                        isAutoEnrolled = existing.isAutoEnrolled
+                    )
+                    speakerLabelById[existing.speakerId] = newLabel
+                    newNick?.let { speakerNamesToIgnore.add(it) }
+                    speakerNamesToIgnore.add(newLabel)
+                }
+            }
+
+            // Save consolidated Patient Round Blocks
+            db.deletePatientsForSession(sessionId)
+            if (mergedPatients.isNotEmpty()) {
+                val patientEntities = mergedPatients.map { p ->
+                    val plans = p.plan.map {
+                        PatientPlanOrder(
+                            category = it.category,
+                            text = it.text,
+                            needsVerification = it.needsVerification
+                        )
+                    }
+                    PatientBlockEntity(
+                        id = UUID.randomUUID().toString(),
+                        sessionId = sessionId,
+                        roundGroupId = finalRoundGroupId,
+                        patientIdentifier = p.patientIdentifier,
+                        approxStartMs = ClipSlicer.parseApproxMmSsToMs(p.approxStart),
+                        approxEndMs = ClipSlicer.parseApproxMmSsToMs(p.approxEnd),
+                        oneLiner = p.oneLiner,
+                        neuroExam = p.neuroExam,
+                        assessment = p.assessment,
+                        problemsJson = json.encodeToString(p.problems),
+                        resultsJson = json.encodeToString(p.resultsMentioned),
+                        pendingJson = json.encodeToString(p.pending),
+                        planJson = json.encodeToString(plans),
+                        teachingJson = json.encodeToString(p.teachingPoints)
+                    )
+                }
+                db.insertPatients(patientEntities)
+            }
+
+            // Slice Permanent Voice Proof Clips (+/- 5s) from local raw audio if present & save final-state items
+            db.upsertSession(session.copy(status = Status.CLIPPING))
+            db.deleteItemsForSession(sessionId)
+            val itemEntities = refinedItems.map { dto ->
+                val itemId = UUID.randomUUID().toString()
+                val globalStartMs = ClipSlicer.parseApproxMmSsToMs(dto.approxStart)
+                val globalEndMs = ClipSlicer.parseApproxMmSsToMs(dto.approxEnd).coerceAtLeast(globalStartMs + 3_000L)
+
+                var slicedClipPath: String? = null
+                var clipStartMs = (globalStartMs - 5_000L).coerceAtLeast(0L)
+                var clipEndMs = globalEndMs + 5_000L
+                var recordedWallMs = firstSourceStartMs + globalStartMs
+
+                if (indexedParts.isNotEmpty() && validAudioSources.isNotEmpty()) {
+                    val mappedPart = findPartForGlobalOffset(indexedParts, globalStartMs)
+                    val partRawFile = validAudioSources.firstOrNull { it.first.id == mappedPart.sessionId }?.second
+                        ?: validAudioSources.first().second
+                    val maxPartMs = mappedPart.durationMs.coerceAtLeast(3_000L)
+                    val localStartMs = (globalStartMs - mappedPart.globalOffsetMs)
+                        .coerceIn(0L, (maxPartMs - 3_000L).coerceAtLeast(0L))
+                    val localEndMs = (globalEndMs - mappedPart.globalOffsetMs)
+                        .coerceIn(localStartMs + 3_000L, maxPartMs)
+                    val slicedClip = ClipSlicer.slicePermanentClip(
+                        context = applicationContext,
+                        rawAdtsFile = partRawFile,
+                        itemId = itemId,
+                        approxStartMs = localStartMs,
+                        approxEndMs = localEndMs
+                    )
+                    recordedWallMs = ClipSlicer.resolveCompactedTimestamp(
+                        rawInputMs = localStartMs,
+                        segments = mappedPart.segments,
+                        sessionStartMs = mappedPart.sourceStartMs,
+                        maxFileDurationMs = maxPartMs
+                    ).wallClockMs
+                    slicedClip?.let { runCatching { it.setLastModified(recordedWallMs) } }
+                    slicedClipPath = slicedClip?.absolutePath
+                    clipStartMs = (localStartMs - 5_000L).coerceAtLeast(0L)
+                    clipEndMs = localEndMs + 5_000L
+                }
+
+                val parsedType = runCatching { ItemType.valueOf(dto.itemType) }.getOrDefault(ItemType.TASK)
+                val resolvedSpeakerLabel = speakerLabelById[dto.speakerId] ?: dto.speakerLabel
+                ItemEntity(
+                    id = itemId,
+                    sessionId = sessionId,
+                    patientIdentifier = dto.patientIdentifier,
+                    type = parsedType,
+                    title = dto.title,
+                    details = dto.details,
+                    speakerId = dto.speakerId,
+                    speakerLabel = resolvedSpeakerLabel,
+                    assignee = dto.assignee,
+                    isForUser = dto.isForUser,
+                    due = dto.due,
+                    priority = dto.priority,
+                    quoteOriginal = dto.quoteOriginal,
+                    quoteEn = dto.quoteEn,
+                    needsVerification = dto.needsVerification,
+                    clipStartMs = clipStartMs,
+                    clipEndMs = clipEndMs,
+                    clipPath = slicedClipPath,
+                    createdMs = recordedWallMs
+                )
+            }
+            val finalItems = if (itemEntities.isEmpty() && (rawRes.summary.isNotBlank() || savedSentences.isNotEmpty())) {
+                val fallbackTitle = rawRes.title.ifBlank { "Conversation Info Note" }
+                val fallbackDetails = rawRes.summary.ifBlank {
+                    savedSentences.take(5).joinToString(" ") { it.textOriginal }
+                }
+                val fallbackSpeaker = savedSpeakers.firstOrNull()
+                listOf(
+                    ItemEntity(
+                        id = UUID.randomUUID().toString(),
+                        sessionId = sessionId,
+                        patientIdentifier = null,
+                        type = ItemType.NOTE,
+                        title = fallbackTitle,
+                        details = fallbackDetails,
+                        speakerId = fallbackSpeaker?.speakerId ?: rawRes.speakers.firstOrNull()?.speakerId ?: "SPK_1",
+                        speakerLabel = fallbackSpeaker?.let { speakerLabelById[it.speakerId] ?: it.speakerLabel }
+                            ?: rawRes.speakers.firstOrNull()?.speakerLabel
+                            ?: "Conversation Voice",
+                        assignee = null,
+                        isForUser = true,
+                        due = null,
+                        priority = "NORMAL",
+                        quoteOriginal = fallbackTitle,
+                        quoteEn = fallbackDetails.take(180),
+                        needsVerification = false,
+                        clipStartMs = 0L,
+                        clipEndMs = (session.endMs - session.startMs).coerceAtLeast(3_000L),
+                        clipPath = validAudioSources.firstOrNull()?.second?.absolutePath,
+                        createdMs = firstSourceStartMs
+                    )
+                )
+            } else {
+                itemEntities
+            }
+            db.insertItems(finalItems)
+
+            val effectiveTitle = rawRes.title.takeIf { it.isNotBlank() }
+                ?: session.title?.takeIf { it.isNotBlank() }
+                ?: "Conversation Session"
+            val effectiveSummary = rawRes.summary.takeIf { it.isNotBlank() }
+                ?: "Deep synthesis completed from saved Stage 1 verbatim transcript."
+            val effectiveContext = rawRes.context.takeIf { it.isNotBlank() && it != "NOISE_OR_TV" }
+                ?: session.context?.takeIf { it != "NOISE_OR_TV" }
+                ?: rawRes.context
+
+            db.upsertSession(
+                session.copy(
+                    mode = finalMode,
+                    roundGroupId = finalRoundGroupId,
+                    eventGroupId = resolvedEventGroupId,
+                    context = effectiveContext,
+                    title = effectiveTitle,
+                    summary = effectiveSummary,
+                    keyPointsJson = json.encodeToString(refinedKeyPoints),
+                    status = Status.DONE,
+                    retryCount = 0,
+                    nextRetryEpochMs = 0L,
+                    lastError = null
+                )
+            )
+
+            Log.i(
+                TAG,
+                "Two-Stage S2 synthesis completed for $sessionId (route=$usedRouteLabel, keyPoints=${refinedKeyPoints.size}, items=${finalItems.size}, patients=${mergedPatients.size}, lines=${savedSentences.size})"
+            )
+
+            if (prefs.autoAddGlossaryTerms && rawRes.discoveredGlossaryTerms.isNotEmpty()) {
+                runCatching {
+                    val ingest = MedicalGlossaryManager.autoIngestDiscoveredTerms(
+                        context = applicationContext,
+                        prefs = prefs,
+                        sessionId = sessionId,
+                        discoveredTerms = rawRes.discoveredGlossaryTerms,
+                        speakerNamesToIgnore = speakerNamesToIgnore,
+                        recordedAtMs = firstSourceStartMs
+                    )
+                    if (ingest.addedCount > 0 || ingest.updatedCount > 0) {
+                        Log.i(
+                            TAG,
+                            "Auto-glossary updated during S2 for $sessionId: +${ingest.addedCount} added, ${ingest.updatedCount} updated"
+                        )
+                    }
+                }.onFailure { err ->
+                    Log.w(TAG, "Auto-glossary ingest failed during S2 for $sessionId: ${err.message}")
+                }
+            }
+
+            if (combinedIds.isEmpty() && prefs.autoMergeContinuousFiles) {
+                runCatching {
+                    autoMergeContinuousClusterIfNeeded(sessionId)
+                }.onFailure { err ->
+                    Log.w(TAG, "Auto-merge continuous cluster check failed after S2 for $sessionId: ${err.message}")
+                }
+            }
+
+            Result.success()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: GeminiUsagePausedException) {
+            Log.i(TAG, "Gemini paused before/during Stage 2 synthesis for $sessionId; preserving Stage 1 transcript checkpoint in QUEUED state.")
+            handlePausedSession(session.copy(summary = STAGE1_TRANSCRIPT_CHECKPOINT_MARKER), AnalysisMode.INFO_EXTRACTION_EN)
+        } catch (e: Exception) {
+            Log.e(TAG, "Two-Stage Stage 2 synthesis failed for $sessionId (Stage 1 transcript checkpoint preserved)", e)
+            val currentAttempt = session.retryCount + 1
+            db.insertAnalysisRun(
+                AnalysisRunEntity(
+                    sessionId = sessionId,
+                    model = prefs.geminiModel,
+                    promptVersion = "${Prompts.PROMPT_VERSION}:TWO_STAGE_S2_SYNTHESIS",
+                    inTokens = 0,
+                    outTokens = 0,
+                    latencyMs = 0L,
+                    ok = false,
+                    errorMsg = e.message
+                )
+            )
+            val cls = GeminiInteractionsClient.classifyApiFailure(e)
+            val missingApiKey = prefs.getAllApiKeys().isEmpty() ||
+                e.message?.contains("No Gemini API key configured", ignoreCase = true) == true
+            val isTransient = !missingApiKey && (
+                cls.isNetworkTransient ||
+                    e is UnknownHostException || e is SocketTimeoutException || e is ConnectException || e is IOException ||
+                    e.message?.contains("429") == true || e.message?.contains("500") == true ||
+                    e.message?.contains("502") == true || e.message?.contains("503") == true ||
+                    e.message?.contains("timed out", ignoreCase = true) == true ||
+                    e.message?.contains("network", ignoreCase = true) == true
+                )
+            val friendlyErr = when {
+                missingApiKey -> "No Gemini API key configured."
+                e is UnknownHostException -> "Offline (waiting for internet)."
+                e is SocketTimeoutException -> "Connection timed out."
+                cls.shouldFailoverKey -> "${cls.category}: ${cls.remediationHint}"
+                else -> e.message?.take(140) ?: "Connection error"
+            }
+            val checkpointPreservedSession = session.copy(summary = STAGE1_TRANSCRIPT_CHECKPOINT_MARKER)
+            if (missingApiKey) {
+                db.upsertSession(
+                    checkpointPreservedSession.copy(
+                        status = Status.FAILED_PERMANENT,
+                        retryCount = currentAttempt,
+                        nextRetryEpochMs = 0L,
+                        lastError = "Transcript saved • Stage 2 text-only retry waiting for API key ($friendlyErr)"
+                    )
+                )
+            } else if (isTransient) {
+                val delayMinutes = when (currentAttempt) {
+                    1 -> 2L
+                    2 -> 5L
+                    3 -> 15L
+                    else -> 30L
+                }
+                db.upsertSession(
+                    checkpointPreservedSession.copy(
+                        status = Status.FAILED_RETRYABLE,
+                        retryCount = currentAttempt,
+                        nextRetryEpochMs = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(delayMinutes),
+                        lastError = "Transcript saved • Retrying Stage 2 text-only in ${delayMinutes}m ($friendlyErr)"
+                    )
+                )
+                scheduleRetry(applicationContext, sessionId, delayMinutes, AnalysisMode.INFO_EXTRACTION_EN)
+            } else if (currentAttempt < MAX_AUTO_RETRIES) {
+                db.upsertSession(
+                    checkpointPreservedSession.copy(
+                        status = Status.FAILED_RETRYABLE,
+                        retryCount = currentAttempt,
+                        nextRetryEpochMs = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(RETRY_INTERVAL_MINUTES),
+                        lastError = "Transcript saved • Stage 2 text-only retry $currentAttempt/$MAX_AUTO_RETRIES in ${RETRY_INTERVAL_MINUTES}m ($friendlyErr)"
+                    )
+                )
+                scheduleRetry(applicationContext, sessionId, RETRY_INTERVAL_MINUTES, AnalysisMode.INFO_EXTRACTION_EN)
+            } else {
+                db.upsertSession(
+                    checkpointPreservedSession.copy(
+                        status = Status.FAILED_PERMANENT,
+                        retryCount = currentAttempt,
+                        nextRetryEpochMs = 0L,
+                        lastError = "Transcript saved • Stage 2 failed after $MAX_AUTO_RETRIES attempts • Tap 'Try Again' for text-only retry ($friendlyErr)"
+                    )
+                )
+            }
+            Result.failure()
         }
     }
 
@@ -1708,7 +2453,10 @@ class SessionAnalyzeWorker(
         private const val TAG = "SessionAnalyzeWorker"
         private const val KEY_SESSION_ID = "session_id"
         private const val KEY_ANALYSIS_MODE = "analysis_mode"
+        private const val KEY_FORCE_FRESH_AUDIO = "force_fresh_audio"
         private const val PRIMARY_INLINE_TOTAL_LIMIT = 11_000_000L
+        private const val AUTO_TWO_STAGE_DURATION_MS = 40_000L
+        const val STAGE1_TRANSCRIPT_CHECKPOINT_MARKER = "Transcript checkpoint saved — preparing deep analysis..."
         const val MAX_AUTO_RETRIES = 3
         const val RETRY_INTERVAL_MINUTES = 10L
 
@@ -1717,13 +2465,14 @@ class SessionAnalyzeWorker(
             sessionId: String,
             mode: AnalysisMode = AnalysisMode.INFO_EXTRACTION_EN
         ) {
-            enqueueImmediate(context, sessionId, mode)
+            enqueueImmediate(context, sessionId, mode, forceFreshAudio = false)
         }
 
         fun enqueueImmediate(
             context: Context,
             sessionId: String,
-            mode: AnalysisMode = AnalysisMode.INFO_EXTRACTION_EN
+            mode: AnalysisMode = AnalysisMode.INFO_EXTRACTION_EN,
+            forceFreshAudio: Boolean = false
         ) {
             val prefs = PreferencesRepo(context)
             if (prefs.isGeminiUsagePausedNow()) {
@@ -1745,7 +2494,8 @@ class SessionAnalyzeWorker(
                 .setInputData(
                     workDataOf(
                         KEY_SESSION_ID to sessionId,
-                        KEY_ANALYSIS_MODE to mode.name
+                        KEY_ANALYSIS_MODE to mode.name,
+                        KEY_FORCE_FRESH_AUDIO to forceFreshAudio
                     )
                 )
                 .setInitialDelay(0, TimeUnit.MILLISECONDS)
@@ -1773,7 +2523,8 @@ class SessionAnalyzeWorker(
                 .setInputData(
                     workDataOf(
                         KEY_SESSION_ID to sessionId,
-                        KEY_ANALYSIS_MODE to mode.name
+                        KEY_ANALYSIS_MODE to mode.name,
+                        KEY_FORCE_FRESH_AUDIO to false
                     )
                 )
                 .setInitialDelay(delayMinutes, TimeUnit.MINUTES)
@@ -1786,15 +2537,24 @@ class SessionAnalyzeWorker(
             )
         }
 
+        /**
+         * Retries a queued or failed session. If a Stage 1 verbatim transcript checkpoint is
+         * already saved in Room and [forceFreshAudio] is false, this resumes Stage 2 text-only
+         * without re-uploading raw audio files.
+         */
         fun retryNow(
             context: Context,
             sessionId: String,
-            mode: AnalysisMode = AnalysisMode.INFO_EXTRACTION_EN
+            mode: AnalysisMode = AnalysisMode.INFO_EXTRACTION_EN,
+            forceFreshAudio: Boolean = false
         ) {
             val db = AppDatabase.get(context).dao()
             CoroutineScope(Dispatchers.IO).launch {
                 val s = db.getSessionById(sessionId) ?: return@launch
-                if (s.combinedSourceIdsJson.isNullOrBlank()) {
+                val hasStage1Checkpoint = !forceFreshAudio &&
+                    mode == AnalysisMode.INFO_EXTRACTION_EN &&
+                    s.summary == STAGE1_TRANSCRIPT_CHECKPOINT_MARKER
+                if (!hasStage1Checkpoint && s.combinedSourceIdsJson.isNullOrBlank()) {
                     val rawFile = s.rawPath?.let { File(it) }
                     if (rawFile == null || !rawFile.exists()) {
                         db.upsertSession(
@@ -1806,20 +2566,39 @@ class SessionAnalyzeWorker(
                         return@launch
                     }
                 }
+                val clearedSummary = if (forceFreshAudio && s.summary == STAGE1_TRANSCRIPT_CHECKPOINT_MARKER) {
+                    null
+                } else {
+                    s.summary
+                }
                 db.upsertSession(
                     s.copy(
+                        summary = clearedSummary,
                         status = Status.QUEUED,
                         retryCount = 0,
                         nextRetryEpochMs = 0L,
                         lastError = null
                     )
                 )
-                enqueueImmediate(context, sessionId, mode)
+                enqueueImmediate(context, sessionId, mode, forceFreshAudio = forceFreshAudio)
             }
         }
 
+        /**
+         * Explicit user-triggered Re-analyze action: clears any Stage 1 transcript checkpoint
+         * and re-uploads raw audio from scratch through the active pipeline.
+         */
+        fun reanalyzeFromAudioNow(context: Context, sessionId: String) {
+            retryNow(
+                context = context,
+                sessionId = sessionId,
+                mode = AnalysisMode.INFO_EXTRACTION_EN,
+                forceFreshAudio = true
+            )
+        }
+
         fun requestOriginalTranscriptNow(context: Context, sessionId: String) {
-            retryNow(context, sessionId, AnalysisMode.VERBATIM_ORIGINAL_TRANSCRIPT)
+            retryNow(context, sessionId, AnalysisMode.VERBATIM_ORIGINAL_TRANSCRIPT, forceFreshAudio = true)
         }
 
         /**

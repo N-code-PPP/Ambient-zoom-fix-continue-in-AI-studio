@@ -352,8 +352,17 @@ fun TimelineScreen(
                                 )
                             }
                             IconButton(
-                                onClick = { onReanalyze(s.id) },
-                                modifier = Modifier.size(30.dp)
+                                onClick = {
+                                    SessionAnalyzeWorker.reanalyzeFromAudioNow(context, s.id)
+                                    Toast.makeText(
+                                        context,
+                                        "Re-analyzing raw audio from Stage 1...",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                },
+                                modifier = Modifier
+                                    .size(30.dp)
+                                    .testTag("timeline_reanalyze_button_${s.id}")
                             ) {
                                 Icon(Icons.Default.Refresh, contentDescription = "Re-analyze")
                             }
@@ -418,7 +427,8 @@ fun TimelineScreen(
                                             color = MaterialTheme.colorScheme.error,
                                             modifier = Modifier.weight(1f)
                                         )
-                                        if (rawExists) {
+                                        val hasTranscriptCheckpoint = s.summary == SessionAnalyzeWorker.STAGE1_TRANSCRIPT_CHECKPOINT_MARKER
+                                        if (rawExists || hasTranscriptCheckpoint) {
                                             Button(
                                                 onClick = { onReanalyze(s.id) },
                                                 contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
@@ -426,11 +436,16 @@ fun TimelineScreen(
                                                     containerColor = MaterialTheme.colorScheme.error,
                                                     contentColor = MaterialTheme.colorScheme.onError
                                                 ),
-                                                modifier = Modifier.height(28.dp)
+                                                modifier = Modifier
+                                                    .height(28.dp)
+                                                    .testTag("timeline_retry_button_${s.id}")
                                             ) {
                                                 Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(12.dp))
                                                 Spacer(modifier = Modifier.width(4.dp))
-                                                Text("Try Again", style = MaterialTheme.typography.labelSmall)
+                                                Text(
+                                                    if (hasTranscriptCheckpoint) "Retry Stage 2" else "Try Again",
+                                                    style = MaterialTheme.typography.labelSmall
+                                                )
                                             }
                                         }
                                     }
@@ -449,6 +464,12 @@ fun TimelineScreen(
                                         verticalAlignment = Alignment.CenterVertically,
                                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                                     ) {
+                                        if (s.summary == SessionAnalyzeWorker.STAGE1_TRANSCRIPT_CHECKPOINT_MARKER) {
+                                            BadgePill(
+                                                text = "📝 Transcript Saved (Text-Only Retry)",
+                                                containerColor = MaterialTheme.colorScheme.primaryContainer
+                                            )
+                                        }
                                         if (rawExists) {
                                             BadgePill(
                                                 text = "💾 Audio Saved (${(s.rawBytes / 1024L).coerceAtLeast(1L)} KB)",

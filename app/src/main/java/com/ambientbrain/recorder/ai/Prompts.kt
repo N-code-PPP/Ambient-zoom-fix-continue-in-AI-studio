@@ -4,9 +4,12 @@ import android.content.Context
 import com.ambientbrain.recorder.data.AttachableVoiceClip
 import com.ambientbrain.recorder.data.PatientPlanOrder
 import com.ambientbrain.recorder.data.PreferencesRepo
+import com.ambientbrain.recorder.data.SessionEntity
+import com.ambientbrain.recorder.data.SessionSpeakerEntity
 import com.ambientbrain.recorder.data.SessionWithDetails
 import com.ambientbrain.recorder.data.SpeakerProfileEntry
 import com.ambientbrain.recorder.data.TranscriptLangMode
+import com.ambientbrain.recorder.data.TranscriptSentenceEntity
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -162,12 +165,13 @@ enum class ReviewSourceMode(val label: String) {
 enum class AnalysisMode {
     INFO_EXTRACTION_EN,
     VERBATIM_ORIGINAL_TRANSCRIPT,
+    TWO_STAGE_SYNTHESIS_FROM_TRANSCRIPT,
     AI_REVIEW_EXTRACTED_ONLY,
     AI_REVIEW_FROM_AUDIO
 }
 
 object Prompts {
-    const val PROMPT_VERSION = "v7.2-voiceprint-10samples-audit"
+    const val PROMPT_VERSION = "v7.3-two-stage-transcribe-analyze"
 
     fun loadDefaultGlossarySummary(context: Context, customTerms: String): String {
         return MedicalGlossaryManager.buildPromptGlossaryText(
@@ -204,11 +208,11 @@ object Prompts {
     ): String {
         val bilingualInstruction = when (transcriptLangMode) {
             TranscriptLangMode.BILINGUAL_TH_EN ->
-                "Include BOTH `text_original` (100% verbatim spoken Thai/English words) AND `text_en` (clear English translation) for every spoken sentence."
+                "Include BOTH `text_original` (100% verbatim code-switched text: transcribe spoken Thai naturally in Thai script, and ALWAYS transcribe English words, drug names, acronyms, labs, and medical terms in exact English spelling — NEVER translate or transliterate English/medical terms into Thai) AND `text_en` (clear English translation) for every spoken sentence."
             TranscriptLangMode.ORIGINAL_ONLY ->
-                "Include `text_original` (100% verbatim spoken Thai/English words) and set `text_en` to null."
+                "Include `text_original` (100% verbatim code-switched text: transcribe spoken Thai naturally in Thai script, and ALWAYS transcribe English words, drug names, acronyms, labs, and medical terms in exact English spelling — NEVER translate or transliterate English/medical terms into Thai) and set `text_en` to null."
             TranscriptLangMode.ENGLISH_ONLY ->
-                "Include `text_original` (verbatim spoken words) and clear `text_en` in English."
+                "Include `text_original` (verbatim spoken Thai in Thai script with all English/medical terms kept in exact English spelling — never translated to Thai) and clear `text_en` in English."
         }
 
         val voiceProfileBlock = buildString {
@@ -322,10 +326,10 @@ $rosterBlock
      * **`voice_signature`**: Write 1 concise objective acoustic + speaking-style fingerprint (pitch range, timbre/warmth/crispness, pace, language mix, e.g., `"Low-baritone calm male, steady teaching pace, mixes English stroke jargon into Thai"`).
      * **`sample_start`, `sample_end`, AND `sample_windows[]`** (`MM:SS`): When raw audio is attached, locate up to **4 cleanest solo speech windows** (each 4–10 seconds long) where ONLY this single speaker talks clearly close to the mic with ZERO cross-talk, ZERO interruptions, and minimal background noise. Put the single cleanest window in `sample_start`/`sample_end`, and list all 1–4 candidate solo windows (best first) in `sample_windows[]` (with `quality`: `"HIGH"` or `"MEDIUM"`). Our on-device acoustic analyzer will score these windows and save up to 10 highest-quality voice samples per profile! Set `sample_start`/`sample_end` to `null` and `sample_windows` to `[]` if no clean solo turn exists or during text-only review.
 
-4. HIGH-SIGNAL KEY POINTS EXTRACTION (`key_points[]` — ZERO NOISE, ZERO DUPLICATES):
-   - Extract 4 to 14 crisp, standalone, non-redundant key points ordered by importance.
-   - Format each key point as: `[Category] Core concrete fact, number/dose, decision, or parameter (Speaker)` where `[Category]` is one of: `[Decision]`, `[Med/Order]`, `[Lab/Imaging]`, `[Clinical]`, `[Risk]`, `[Action]`, `[Key Fact]`, `[Follow-Up]`.
-   - Every bullet MUST carry exact numbers, doses, criteria, or concrete takeaways—NEVER write vague filler like "Discussed patient plan" or repeat points already stated in another bullet.
+4. EXHAUSTIVE, HIGH-SIGNAL KEY POINTS EXTRACTION (`key_points[]` — NO LIMIT ON COUNT, FULL CONCRETE DETAILS):
+   - Do NOT limit or cap the number of key points! A dense clinical round or detailed conversation can legitimately have 15, 25, or more distinct key points — extract EVERY distinct important fact, parameter, plan, decision, risk, or follow-up ordered by importance.
+   - Format each key point as: `[Category] Complete concrete detail including exact planned times/dates, drug names, dosages, routes, frequencies, numeric lab/imaging results, thresholds, or reasoning (Speaker)` where `[Category]` is one of: `[Decision]`, `[Med/Order]`, `[Lab/Imaging]`, `[Clinical]`, `[Risk]`, `[Action]`, `[Key Fact]`, `[Follow-Up]`.
+   - Every bullet MUST preserve concrete granular details (e.g., exact scheduled administration time, drug dose/route/frequency like `Keppra 1000 mg IV q12h starting at 18:00`, BP/MAP targets, lab values, follow-up dates, responsible person) — NEVER compress away important specifics, NEVER write vague filler like "Discussed patient plan", and avoid exact duplicates.
 
 5. PRECISION ACTIONABLE TASKS, DECISIONS, EVENTS & PATIENTS (`patients[]`, `items[]`):
    - Populate `patients[]` thoroughly for clinical rounds (Problems, Results, Pending, Categorized Plan, Teaching Points).
@@ -341,8 +345,12 @@ $rosterBlock
    - **High-Alert Clinical Verification (`needs_verification`)**: Set `needs_verification = true` strictly for high-alert drug doses/rates (anticoagulants, thrombolytics, IV AEDs, insulin, pressors, potassium, hypertonic saline), weight/renal dose adjustments, invasive procedures, or acoustically uncertain numbers/names—keep `false` for ordinary low-risk tasks.
    - Always capture exact spoken `quote_original`, optional `quote_en`, and tight `approx_start` / `approx_end` (`MM:SS`) for lossless voice-proof audio slicing.
 
-6. 100% ORIGINAL VERBATIM TRANSCRIPTION (`transcript[]` — DEDICATED ON-DEMAND PASS):
+6. 100% ORIGINAL VERBATIM TRANSCRIPTION (`transcript[]` — STAGE 1 & ON-DEMAND PASS):
    - When the session mandate is `VERBATIM_ORIGINAL_TRANSCRIPT`, transcribe 100% of spoken dialogue word-for-word from 00:00 to the very end without skipping, condensing, or stopping early.
+   - **MANDATORY THAI + ENGLISH / MEDICAL TERM SCRIPT RULE**: Conversations are commonly in Thai mixed with English words and medical terminology.
+     * For Thai speech: transcribe naturally in **Thai script**.
+     * For ANY English word, medical/clinical term, drug name, dosage unit, lab/imaging name, anatomical term, or abbreviation (e.g., `Keppra 1000 mg IV q12h`, `Depakine`, `rt-PA`, `CT brain`, `MRI`, `EEG`, `NIHSS`, `GCS`, `BP`, `MAP`, `sodium`, `potassium`, `consult`, `admit`, `discharge`, `follow-up`): **ALWAYS transcribe in exact English spelling** — NEVER translate or transliterate English words or medical terms into Thai script!
+   - When tone/hesitation/acoustic clarity carries clinical or decision meaning, add brief inline bracket cues such as `[uncertain]` or `[emphasis]` inside `text_original` so downstream synthesis retains full nuance.
    - $bilingualInstruction
 
 7. AUTO-DISCOVER NOVEL NEUROLOGY / MEDICAL GLOSSARY TERMS (`discovered_glossary_terms[]`):
@@ -403,10 +411,10 @@ $headerBlock
 - Active Execution Mode: GATHER_AND_REORGANIZE_ALL_INFO_EN
 
 CRITICAL PASS 1 MANDATE (INFO GATHERING + REORGANIZATION + PRECISION TASKS & KEY POINTS):
-1. Gather ALL important facts, clinical figures, medication doses, decisions, rationales, names, dates, and action items from start to finish of the attached audio(s).
+1. Gather ALL important facts, clinical figures, medication doses, schedules/times, decisions, rationales, names, dates, and action items from start to finish of the attached audio(s).
 2. Reorganize ALL gathered information in English inside `summary` using the context-appropriate structure (Clinical Patient Breakdown vs. Work/Topic Reorganization vs. Personal/Call Topics) with clear speaker attribution ("who said/decided what") throughout.
 3. Identify every distinct speaker accurately in `speakers[]` with up to 3 clean solo `sample_windows` (zero overlap/cross-talk) per speaker.
-4. Extract 4–14 non-redundant, categorized `key_points[]` (`[Category] Fact/Dose/Decision (Speaker)`), complete `patients[]` (if clinical), atomic verb-first FINAL-STATE `items[]` synced with patient plans (excluding cancelled orders or unchanged tasks already captured in Prior Event Context), and up to 8 novel clinical terms in `discovered_glossary_terms[]` (or `[]` if non-medical).
+4. Extract ALL distinct, non-redundant categorized `key_points[]` with NO upper limit on count (`[Category] Complete fact including planned times/dates, drug doses/routes/frequencies, lab values, or decision (Speaker)`), complete `patients[]` (if clinical), atomic verb-first FINAL-STATE `items[]` synced with patient plans (excluding cancelled orders or unchanged tasks already captured in Prior Event Context), and up to 8 novel clinical terms in `discovered_glossary_terms[]` (or `[]` if non-medical).
 5. Set `transcript` to `[]` in this Pass 1 so your full output capacity builds an exhaustive, deeply reorganized English knowledge breakdown + complete tasks & key points (full transcription runs separately on user demand).
 """.trimIndent()
 
@@ -414,10 +422,36 @@ CRITICAL PASS 1 MANDATE (INFO GATHERING + REORGANIZATION + PRECISION TASKS & KEY
 $headerBlock
 - Active Execution Mode: DEDICATED_100_PERCENT_VERBATIM_TRANSCRIPTION
 
-CRITICAL PASS 2 MANDATE (100% ORIGINAL WORD-FOR-WORD TRANSCRIPTION ONLY):
-1. Devote 100% of your output tokens strictly to `speakers[]` and a COMPLETE word-for-word `transcript[]` from 00:00 to the very end of the recording(s).
-2. Every single spoken sentence, back-and-forth exchange, number, clinical term, and interjection MUST appear in `transcript[]` with exact `text_original`, accurate `text_en` translation (per language rule), `MM:SS` timestamp, and accurate `speaker_label`. Never skip or summarize dialogue!
-3. Do NOT spend tokens regenerating lengthy `summary`, `key_points`, `patients`, or `items` in this pass—set `summary = "100% verbatim transcript completed"`, `key_points = []`, `patients = []`, `items = []`, and `discovered_glossary_terms = []` (existing Pass 1 reorganized info is already preserved in local storage).
+CRITICAL VERBATIM TRANSCRIPTION MANDATE (STAGE 1 / 100% WORD-FOR-WORD DIARIZED TRANSCRIPT):
+1. Devote 100% of your output tokens strictly to accurate `speakers[]` (including up to 4 clean solo `sample_windows` per speaker) and a COMPLETE word-for-word `transcript[]` from 00:00 to the very end of the recording(s).
+2. THAI + ENGLISH / MEDICAL TERM SCRIPT RULE:
+   - Transcribe spoken Thai naturally in Thai script.
+   - ALWAYS transcribe English words, medical terms, drug names, dosages, units, labs, imaging, and acronyms in exact English spelling inside `text_original` (NEVER translate or transliterate English words or medical terms into Thai!).
+   - Preserve exact spoken numbers, medication doses, scheduled times, dates, patient identifiers, and subtle acoustic/hesitation cues (`[uncertain]`, `[emphasis]`) so downstream analysis retains 100% fidelity.
+3. Every single spoken sentence, back-and-forth exchange, number, clinical term, and interjection MUST appear in `transcript[]` with exact `text_original`, accurate `text_en` (per language rule), accurate `MM:SS` timestamp, and consistent `speaker_id` + `speaker_label`. Never skip or summarize dialogue!
+4. Do NOT spend tokens generating `summary`, `key_points`, `patients`, or `items` in this transcription pass—set `summary = "100% verbatim transcript completed"`, `key_points = []`, `patients = []`, `items = []`, and `discovered_glossary_terms = []`.
+""".trimIndent()
+
+            AnalysisMode.TWO_STAGE_SYNTHESIS_FROM_TRANSCRIPT -> """
+$headerBlock
+- Active Execution Mode: STAGE_2_DEEP_SYNTHESIS_FROM_COMPLETE_MERGED_TRANSCRIPT
+
+CRITICAL STAGE 2 SYNTHESIS MANDATE (GLOBAL TEXT-ONLY DEEP ANALYSIS FROM COMPLETE MERGED TRANSCRIPT):
+You are receiving the COMPLETE, chronologically merged verbatim diarized transcript from Stage 1 (no raw audio is attached). Because you can see the entire conversation from start to finish in one unified view:
+1. EXHAUSTIVE ENGLISH REORGANIZATION (`title`, `context`, `is_clinical_round`, `summary`):
+   - Synthesize ALL facts, numbers, medication regimens, schedules/times, rationales, debates, and final outcomes across the ENTIRE transcript into one cohesive, deeply reorganized English `summary` using the context-appropriate Markdown headings (Clinical Patient Breakdown vs. Work/Topic Reorganization vs. Personal/Call Topics) with exact speaker attribution throughout.
+2. UNLIMITED DETAILED `key_points[]` (NO COUNT CAP):
+   - Do NOT put any limit on the number of key points! Extract EVERY distinct important detail across the whole conversation.
+   - Inside each bullet (`[Category] ... (Speaker)`), explicitly preserve granular specifics such as planned administration times/dates, drug names, dosages, routes, frequencies, numeric lab/imaging results, BP/MAP targets, deadlines, and conditions (e.g., `[Med/Order] Start Keppra 1000 mg IV loading then 500 mg IV q12h starting today at 18:00; recheck level in 48h (Ajarn Somchai)`).
+3. FULL-CONVERSATION RECONCILIATION (`patients[]` & `items[]`):
+   - Reconcile every patient discussed across early and late parts of the conversation into unified `patients[]` blocks with complete Problems, Results, Pending, Categorized Plan, and Teaching Points.
+   - Emit atomic, verb-first FINAL-STATE `items[]` synced with patient plans: if a plan was proposed early and changed/held/cancelled later in the transcript, emit ONLY the final agreed action as an active `TASK` and capture the revision/cancellation in `DECISION` or `details`.
+   - Copy exact `approx_start` and `approx_end` (`MM:SS`) directly from the matching transcript sentence timestamps (and exact `quote_original` / `quote_en`) so on-device voice-proof audio clips slice accurately!
+4. RETROACTIVE SPEAKER UNIFICATION (`speakers[]`):
+   - Preserve every Stage 1 `speaker_id` and `matched_profile_id`. If a speaker's real name or clearer role was revealed later in the transcript, upgrade their `nickname`, `relatable_title`, and `speaker_label` consistently across `speakers[]`, `items[]`, `key_points[]`, and `summary`. Set `sample_start = null`, `sample_end = null`, `sample_windows = []` (Stage 1 already extracted voice samples).
+5. GLOSSARY & TRANSCRIPT FIELD:
+   - Emit up to 8 novel medical/neurology terms in `discovered_glossary_terms[]` (or `[]` if non-medical).
+   - Set `transcript` to `[]` (the complete Stage 1 verbatim transcript is already stored safely in local storage).
 """.trimIndent()
 
             AnalysisMode.AI_REVIEW_EXTRACTED_ONLY -> """
@@ -427,7 +461,7 @@ $headerBlock
 CRITICAL AI REVIEW MANDATE (TEXT-ONLY AUDIT & CONTINUOUS MERGE SYNTHESIS):
 You are reviewing ONLY previously extracted records (summaries, key points, transcripts, patients, tasks/decisions) from one or more saved audio files—no raw audio is attached.
 1. CONSOLIDATE & RECONCILE: Merge and reorganize all previously extracted information chronologically into a clean, non-redundant English `summary`, unified `speakers[]`, updated `patients[]` (reconciling duplicate/continuing cases across clips), and reconciled final-state `items[]` (eliminate superseded/duplicate orders, elevate high-alert doses).
-2. EXTRACT HIGH-SIGNAL `key_points[]`: Produce 4–14 concise, concrete `[Category] Fact/Dose/Decision (Speaker)` takeaways synthesizing across all included segments, plus any novel medical terms in `discovered_glossary_terms[]`.
+2. EXTRACT UNLIMITED DETAILED `key_points[]`: Produce ALL distinct, concrete `[Category] Fact/Time/Dose/Decision (Speaker)` takeaways with NO count limit—including exact planned times, drug doses, routes, frequencies, and numeric values—synthesizing across all included segments, plus any novel medical terms in `discovered_glossary_terms[]`.
 3. GENERATE `ai_review_report` (Markdown audit report covering):
    - **Executive Quality & Completeness Audit**: Key consolidated outcome, continuity summary across recordings, and confidence based on the stored records.
    - **Cross-Checks, Gaps & Potential Contradictions**: Identify any missing clinical details, ambiguous orders, dose/plan mismatches across continuous segments, or items needing human verification (`needs_verification`).
@@ -441,7 +475,7 @@ $headerBlock
 
 CRITICAL DEEP AI REVIEW MANDATE (RE-LISTEN RAW AUDIO + VERIFY & AUDIT):
 1. RE-LISTEN TO EVERY SECOND of the attached raw audio recording(s) from 00:00 to the end, cross-checking against any previously extracted context provided above.
-2. CATCH MISSED OR MISHEARD DETAILS: Correct any speaker attribution errors (including `sample_windows` for clean solo speaker turns), recover exact medication doses, vital signs, numbers, names, or action items omitted in earlier extraction, and produce a comprehensive, reorganized English `summary`, 4–14 crisp `key_points[]`, full `patients[]`, verified atomic FINAL-STATE `items[]` with tight `approx_start`/`approx_end` timestamps for voice-proof clips, and any newly heard clinical terms in `discovered_glossary_terms[]`.
+2. CATCH MISSED OR MISHEARD DETAILS: Correct any speaker attribution errors (including `sample_windows` for clean solo speaker turns), recover exact medication doses, planned times, vital signs, numbers, names, or action items omitted in earlier extraction, and produce a comprehensive, reorganized English `summary`, UNLIMITED detailed `key_points[]` (no count cap; include times, doses, frequencies, labs, and speaker), full `patients[]`, verified atomic FINAL-STATE `items[]` with tight `approx_start`/`approx_end` timestamps for voice-proof clips, and any newly heard clinical terms in `discovered_glossary_terms[]`.
 3. GENERATE `ai_review_report` (Markdown audit report covering):
    - **Audio Verification & Newly Uncovered Details**: What this fresh audio pass confirmed, corrected, or newly recovered compared to a quick pass.
    - **High-Alert Cross-Checks & Ambiguities**: Flag acoustically uncertain figures, high-alert drug doses, or conflicting plans across segments.
@@ -531,6 +565,64 @@ CRITICAL DEEP AI REVIEW MANDATE (RE-LISTEN RAW AUDIO + VERIFY & AUDIT):
         }.trim()
     }
 
+    /**
+     * Serializes the COMPLETE Stage 1 merged verbatim diarized transcript into a structured
+     * document for Stage 2 text-only deep synthesis (zero premature sentence truncation).
+     */
+    fun buildMergedTranscriptDocument(
+        session: SessionEntity,
+        speakers: List<SessionSpeakerEntity>,
+        sentences: List<TranscriptSentenceEntity>,
+        priorEventContextText: String = ""
+    ): String {
+        val fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneId.systemDefault())
+        val startStr = fmt.format(Instant.ofEpochMilli(session.startMs))
+        val endStr = fmt.format(Instant.ofEpochMilli(session.endMs))
+        fun formatMmSs(ms: Long): String {
+            val totalSec = (ms / 1000L).coerceAtLeast(0L)
+            val m = totalSec / 60L
+            val s = totalSec % 60L
+            return "${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}"
+        }
+        return buildString {
+            appendLine("=== COMPLETE STAGE 1 MERGED VERBATIM TRANSCRIPT ===")
+            appendLine("Session ID: ${session.id}")
+            appendLine("Time: $startStr to $endStr | Mode: ${session.mode.name} | HadPhoneCall: ${session.hadPhoneCall}")
+            if (!session.title.isNullOrBlank()) {
+                appendLine("Provisional Title: ${session.title}")
+            }
+            if (priorEventContextText.isNotBlank()) {
+                appendLine()
+                appendLine("--- PRIOR EVENT CONTEXT ---")
+                appendLine(priorEventContextText.trim())
+            }
+            if (speakers.isNotEmpty()) {
+                appendLine()
+                appendLine("--- STAGE 1 IDENTIFIED SPEAKERS (${speakers.size}) ---")
+                speakers.forEach { spk ->
+                    val nick = spk.nickname?.takeIf { it.isNotBlank() } ?: spk.speakerLabel
+                    val title = spk.relatableTitle?.takeIf { it.isNotBlank() } ?: spk.inferredRole
+                    val titleTag = title?.takeIf { it.isNotBlank() }?.let { " | Title: $it" }.orEmpty()
+                    val profileTag = spk.matchedProfileId?.takeIf { it.isNotBlank() }?.let { " | matched_profile_id=$it" }.orEmpty()
+                    val voiceTag = spk.voiceSignature?.takeIf { it.isNotBlank() }?.let { " | Voice: $it" }.orEmpty()
+                    val userTag = if (spk.isUser) " | [USER]" else ""
+                    appendLine("- [speaker_id=${spk.speakerId}] Label: '${spk.speakerLabel}' | Nickname: '$nick'$titleTag$profileTag$userTag$voiceTag")
+                }
+            }
+            appendLine()
+            val sorted = sentences.sortedBy { it.ordinal }
+            appendLine("--- COMPLETE CHRONOLOGICAL TRANSCRIPT (${sorted.size} LINES) ---")
+            sorted.forEach { sent ->
+                val ts = formatMmSs(sent.approxMs)
+                appendLine("[$ts] ${sent.speakerLabel} [speaker_id=${sent.speakerId}]: ${sent.textOriginal}")
+                val en = sent.textEn?.trim()
+                if (!en.isNullOrBlank() && !en.equals(sent.textOriginal.trim(), ignoreCase = true)) {
+                    appendLine("  EN: $en")
+                }
+            }
+        }.trim()
+    }
+
     fun buildSystemInstruction(
         userDisplayName: String,
         transcriptLangMode: TranscriptLangMode,
@@ -582,7 +674,7 @@ CRITICAL DEEP AI REVIEW MANDATE (RE-LISTEN RAW AUDIO + VERIFY & AUDIT):
             }
             putJsonObject("key_points") {
                 put("type", "array")
-                put("description", "4-14 distinct, non-redundant high-signal takeaways formatted as `[Category] Concrete fact/dose/decision (Speaker)`.")
+                put("description", "All distinct, non-redundant high-signal takeaways (NO upper count limit) formatted as `[Category] Concrete fact, planned time, drug dose/route/frequency, lab value, or decision (Speaker)`.")
                 putJsonObject("items") { put("type", "string") }
             }
             putJsonObject("speakers") {

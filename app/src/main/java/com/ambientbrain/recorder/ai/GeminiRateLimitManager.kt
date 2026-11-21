@@ -814,20 +814,42 @@ object GeminiRateLimitManager {
         reservation: SlotReservation? = null
     ) {
         if (actualInputTokens <= 0) return
-        val normalizedModel = PreferencesRepo.normalizeSupportedModel(model)
+        val normalizedResolved = PreferencesRepo.normalizeSupportedModel(model)
+        val normalizedReserved = reservation?.model?.let { PreferencesRepo.normalizeSupportedModel(it) } ?: normalizedResolved
         synchronized(ledgerLock) {
-            val key = bucketKey(apiKey, normalizedModel)
-            val events = windowEventsByKeyModel[key]
-            if (!events.isNullOrEmpty()) {
-                val targetIdx = if (reservation != null) {
-                    events.indexOfLast { it.id == reservation.reservationId }.takeIf { it >= 0 } ?: events.lastIndex
-                } else {
-                    events.lastIndex
+            val nowMs = System.currentTimeMillis()
+            val reservedKey = bucketKey(apiKey, normalizedReserved)
+            val resolvedKey = bucketKey(apiKey, normalizedResolved)
+            if (reservedKey == resolvedKey) {
+                val events = windowEventsByKeyModel[resolvedKey]
+                if (!events.isNullOrEmpty()) {
+                    val targetIdx = if (reservation != null) {
+                        events.indexOfLast { it.id == reservation.reservationId }.takeIf { it >= 0 } ?: events.lastIndex
+                    } else {
+                        events.lastIndex
+                    }
+                    events[targetIdx] = events[targetIdx].copy(inputTokens = actualInputTokens.toLong())
                 }
-                events[targetIdx] = events[targetIdx].copy(inputTokens = actualInputTokens.toLong())
+            } else {
+                // Model fell back internally: release estimated tokens from reserved model bucket and record actual tokens under resolved model
+                val reservedEvents = windowEventsByKeyModel[reservedKey]
+                if (!reservedEvents.isNullOrEmpty() && reservation != null) {
+                    val idx = reservedEvents.indexOfLast { it.id == reservation.reservationId }
+                    if (idx >= 0) reservedEvents.removeAt(idx)
+                }
+                val resolvedEvents = windowEventsByKeyModel.getOrPut(resolvedKey) { mutableListOf() }
+                pruneWindowLocked(resolvedEvents, nowMs)
+                resolvedEvents.add(
+                    UsageEvent(
+                        id = reservation?.reservationId ?: nextReservationId.getAndIncrement(),
+                        atMs = nowMs,
+                        inputTokens = actualInputTokens.toLong()
+                    )
+                )
+                lastRequestAtByKeyModel[resolvedKey] = nowMs
             }
         }
-        refreshTelemetry(prefs, normalizedModel, "Completed ($actualInputTokens in-tokens)")
+        refreshTelemetry(prefs, normalizedResolved, "Completed ($actualInputTokens in-tokens)")
     }
 
     /**

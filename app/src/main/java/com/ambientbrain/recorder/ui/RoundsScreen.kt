@@ -391,7 +391,16 @@ private fun RoundDetailView(
                 )
             }
             if (rawFileExists) {
-                IconButton(onClick = onReanalyze) {
+                IconButton(
+                    onClick = {
+                        SessionAnalyzeWorker.reanalyzeFromAudioNow(context, details.session.id)
+                        Toast.makeText(
+                            context,
+                            "Re-analyzing raw audio from Stage 1...",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                ) {
                     Icon(Icons.Default.Refresh, contentDescription = "Re-analyze session")
                 }
             }

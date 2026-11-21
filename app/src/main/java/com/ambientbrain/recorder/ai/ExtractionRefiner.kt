@@ -58,7 +58,7 @@ object ExtractionRefiner {
         rawKeyPoints: List<String>,
         patients: List<GeminiPatientDto>,
         items: List<GeminiExtractedItemDto>,
-        maxCount: Int = 16
+        maxCount: Int = Int.MAX_VALUE
     ): List<String> {
         val cleanedCandidates = mutableListOf<String>()
 
@@ -73,23 +73,23 @@ object ExtractionRefiner {
         // when key_points are sparse (or empty on dense conversations).
         if (cleanedCandidates.size < 4) {
             items.filter { it.itemType == "DECISION" || it.priority == "URGENT" || it.priority == "HIGH" }
-                .take(5)
                 .forEach { itItem ->
                     val prefix = when (itItem.itemType) {
                         "DECISION" -> "[Decision]"
                         else -> "[Action]"
                     }
                     val pat = itItem.patientIdentifier?.takeIf { p -> p.isNotBlank() }?.let { "$it: " }.orEmpty()
+                    val dueTag = itItem.due?.takeIf { d -> d.isNotBlank() }?.let { " — Timing: $it" }.orEmpty()
                     val spk = itItem.speakerLabel.takeIf { s -> s.isNotBlank() && !s.startsWith("Speaker") }?.let { " ($it)" }.orEmpty()
-                    cleanedCandidates.add("$prefix $pat${itItem.title}$spk")
+                    cleanedCandidates.add("$prefix $pat${itItem.title}$dueTag$spk")
                 }
 
             patients.forEach { p ->
-                val topPlan = p.plan.firstOrNull { it.category in setOf("MEDICATION", "INVESTIGATION", "PROCEDURE") }
-                if (topPlan != null) {
-                    cleanedCandidates.add("[${topPlan.category.lowercase().replaceFirstChar { it.uppercase() }}] ${p.patientIdentifier}: ${topPlan.text}")
-                } else if (p.assessment.isNotBlank()) {
-                    cleanedCandidates.add("[Clinical] ${p.patientIdentifier}: ${p.assessment.take(120)}")
+                p.plan.filter { it.category in setOf("MEDICATION", "INVESTIGATION", "PROCEDURE") }.forEach { planOrder ->
+                    cleanedCandidates.add("[${planOrder.category.lowercase().replaceFirstChar { it.uppercase() }}] ${p.patientIdentifier}: ${planOrder.text}")
+                }
+                if (p.plan.none { it.category in setOf("MEDICATION", "INVESTIGATION", "PROCEDURE") } && p.assessment.isNotBlank()) {
+                    cleanedCandidates.add("[Clinical] ${p.patientIdentifier}: ${p.assessment.take(180)}")
                 }
             }
         }
@@ -101,7 +101,7 @@ object ExtractionRefiner {
 
             val dupIndex = deduped.indexOfFirst { existing ->
                 val existTokens = tokenize(stripCategoryPrefix(existing))
-                tokenJaccardSimilarity(candTokens, existTokens) >= 0.66 ||
+                tokenJaccardSimilarity(candTokens, existTokens) >= 0.72 ||
                     isSubstringMatch(stripCategoryPrefix(candidate), stripCategoryPrefix(existing))
             }
 
@@ -116,9 +116,8 @@ object ExtractionRefiner {
             }
         }
 
-        return deduped
-            .sortedByDescending { scoreKeyPointImportance(it) }
-            .take(maxCount)
+        val sorted = deduped.sortedByDescending { scoreKeyPointImportance(it) }
+        return if (maxCount == Int.MAX_VALUE) sorted else sorted.take(maxCount)
     }
 
     /**

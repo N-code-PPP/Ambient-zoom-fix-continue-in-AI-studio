@@ -47,6 +47,7 @@ object ContinuousMergePlanner {
         val s = d.session
         val summaryOk = !s.summary.isNullOrBlank() &&
             s.summary != "100% verbatim transcript completed" &&
+            s.summary != SessionAnalyzeWorker.STAGE1_TRANSCRIPT_CHECKPOINT_MARKER &&
             s.context != "NOISE_OR_TV"
         return summaryOk || d.sentences.isNotEmpty() || d.patients.isNotEmpty() || d.items.isNotEmpty()
     }

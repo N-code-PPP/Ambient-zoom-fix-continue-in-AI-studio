@@ -352,10 +352,10 @@ fun SessionTranscriptSheet(
                         OutlinedButton(
                             onClick = {
                                 activeTab = 0
-                                onReanalyze(session.id)
+                                SessionAnalyzeWorker.reanalyzeFromAudioNow(context, session.id)
                                 Toast.makeText(
                                     context,
-                                    "Asking Gemini to gather & describe all conversation info in English...",
+                                    "Re-analyzing raw audio from Stage 1...",
                                     Toast.LENGTH_SHORT
                                 ).show()
                             },

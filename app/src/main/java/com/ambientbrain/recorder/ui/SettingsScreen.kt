@@ -120,6 +120,7 @@ import com.ambientbrain.recorder.data.ModelAllowanceEntry
 import com.ambientbrain.recorder.data.PreferencesRepo
 import com.ambientbrain.recorder.data.SpeakerProfileEntry
 import com.ambientbrain.recorder.data.TranscriptLangMode
+import com.ambientbrain.recorder.data.TwoStagePipelineMode
 import com.ambientbrain.recorder.data.VoiceProfileSample
 import com.ambientbrain.recorder.service.MeetingMp4Muxer
 import com.ambientbrain.recorder.service.ShizukuAdbManager
@@ -165,6 +166,7 @@ fun SettingsScreen(
     var allowanceProgress by remember { mutableStateOf<String?>(null) }
     var micSharingMode by remember { mutableStateOf(prefs.micSharingMode) }
     var langMode by remember { mutableStateOf(prefs.transcriptLangMode) }
+    var twoStagePipelineMode by remember { mutableStateOf(prefs.twoStagePipelineMode) }
     var autoDetectRounds by remember { mutableStateOf(prefs.autoDetectRounds) }
     var autoRecognizeVoiceProfiles by remember { mutableStateOf(prefs.autoRecognizeVoiceProfiles) }
     var autoMergeContinuousFiles by remember { mutableStateOf(prefs.autoMergeContinuousFiles) }
@@ -290,6 +292,7 @@ fun SettingsScreen(
         prefs.fallbackGeminiModel = fallbackModel
         prefs.micSharingMode = micSharingMode
         prefs.transcriptLangMode = langMode
+        prefs.twoStagePipelineMode = twoStagePipelineMode
         prefs.autoDetectRounds = autoDetectRounds
         prefs.autoRecognizeVoiceProfiles = autoRecognizeVoiceProfiles
         prefs.autoMergeContinuousFiles = autoMergeContinuousFiles
@@ -316,6 +319,7 @@ fun SettingsScreen(
         allowanceEntries = prefs.getCachedModelAllowance()
         micSharingMode = prefs.micSharingMode
         langMode = prefs.transcriptLangMode
+        twoStagePipelineMode = prefs.twoStagePipelineMode
         autoDetectRounds = prefs.autoDetectRounds
         autoRecognizeVoiceProfiles = prefs.autoRecognizeVoiceProfiles
         autoMergeContinuousFiles = prefs.autoMergeContinuousFiles
@@ -349,6 +353,7 @@ fun SettingsScreen(
                 myVoiceSamples = prefs.getMyVoiceSamples()
                 hasProfile = myVoiceSamples.isNotEmpty()
                 speakerRoster = prefs.getSpeakerRoster()
+                twoStagePipelineMode = prefs.twoStagePipelineMode
                 autoRecognizeVoiceProfiles = prefs.autoRecognizeVoiceProfiles
                 autoAddGlossaryTerms = prefs.autoAddGlossaryTerms
                 structuredGlossary = prefs.getStructuredGlossaryEntries()
@@ -1686,6 +1691,51 @@ fun SettingsScreen(
                         )
                     }
                 }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "Two-Stage Analysis Pipeline (Transcribe → Analyze)",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f)
+                    )
+                    BadgePill(
+                        text = twoStagePipelineMode.label,
+                        containerColor = MaterialTheme.colorScheme.primaryContainer
+                    )
+                }
+                Text(
+                    text = twoStagePipelineMode.shortDesc,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    TwoStagePipelineMode.entries.forEach { mode ->
+                        FilterChip(
+                            selected = twoStagePipelineMode == mode,
+                            onClick = {
+                                twoStagePipelineMode = mode
+                                prefs.twoStagePipelineMode = mode
+                            },
+                            label = { Text(mode.label, style = MaterialTheme.typography.labelMedium) },
+                            modifier = Modifier.testTag("two_stage_mode_${mode.name.lowercase(Locale.US)}")
+                        )
+                    }
+                }
+                Text(
+                    text = "• Uses your Primary Model across the API Key Pool for both stages\n• Thai speech stays in Thai; English & medical terms stay in English\n• Stage 1 transcript checkpoints locally so retries stay text-only (manual Re-analyze re-uploads audio) • Zoom/Webex audio excluded",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
 
